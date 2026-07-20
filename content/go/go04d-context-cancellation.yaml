@@ -1,0 +1,355 @@
+# Pilot lesson — authored per content/go/PILOT-CONVENTIONS.md; verify: make verify ID=go04d-context-cancellation
+schema_version: 1
+id: go04d-context-cancellation
+tag: go04d
+title: "Go: context — cancellation, deadlines, and the cleanup you actually run"
+track: go
+week: "Track Go · Module 04/05 (pilot) · Lesson 4"
+priority: attack
+content_rev: 1
+toolchain: { go: "1.26" }
+prerequisites: [go04c-select-mechanics]
+altitude: ramp
+summary: >
+  You already run this discipline in conclave — context + WaitGroup teardown, leak-free under
+  -race. This lesson pins down the semantics that discipline stands on: a context is a
+  cancellation broadcast tree whose Done() channel closes exactly once, whose Err() is a sticky
+  record of the FIRST cause (context.Canceled vs context.DeadlineExceeded), and whose deadline
+  timer stays parked until expiry unless cancel() — or a dying parent — releases it early. Three rules fall out:
+  compare causes with errors.Is, give every blocking receive a ctx.Done() arm, and defer
+  cancel() unconditionally.
+
+learning_objectives:
+  - { id: go04d-o1, bloom: analyze,  text: "Predict Done()/Err() behavior for WithCancel vs WithTimeout contexts, including Err stickiness and error identity under errors.Is" }
+  - { id: go04d-o2, bloom: create,   text: "Retrofit a ctx.Done() select arm into a blocking worker loop so it returns within one cancel propagation, without breaking drain-to-close" }
+  - { id: go04d-o3, bloom: evaluate, text: "Defend the unconditional defer cancel() rule: name what concretely leaks without it, for how long, and against which rejected alternatives" }
+
+teach:
+  - heading: "Done() closes once; Err() is the sticky first cause"
+    covers: [go04d-o1]
+    body: |
+      Done() returns a receive-only channel that is closed exactly once, when the context
+      dies — by its cancel func, by its deadline, or by its parent dying (cancellation flows
+      DOWN the tree, never up). Err() is the post-mortem: nil while live, then permanently
+      the FIRST cause — context.Canceled if cancel() won, context.DeadlineExceeded if the
+      timer won. Cancel a 100 ms WithTimeout ctx at 10 ms and Err() says Canceled forever —
+      cancel() also STOPS the parked timer, so the 100 ms deadline never even fires; a fire
+      that races the cancel is a no-op on an already-dead context.
+
+      Both causes are sentinel errors, but by the time they cross an API layer they are
+      usually wrapped (fmt.Errorf %w) — so identity checks are errors.Is(ctx.Err(),
+      context.Canceled), never ==, never string comparison.
+
+      > [!KEY] Done() closes exactly once; Err() is sticky and names the FIRST cause. Test identity with errors.Is.
+  - heading: "Every blocking receive needs a Done arm"
+    covers: [go04d-o2]
+    body: |
+      `for j := range jobs` has no context awareness: it exits only when jobs closes. Those
+      are two different signals on two different axes — close(jobs) is the producer's "no
+      more data" (go04a ownership), ctx.Done() is the lifecycle's "stop now" — and a worker
+      must listen to both. select (go04c) is how one receive watches two channels:
+
+      ```go
+      for {
+          select {
+          case <-ctx.Done():
+              return sum // stop now: lifecycle wins
+          case j, ok := <-jobs:
+              if !ok {
+                  return sum // no more data: producer closed
+              }
+              sum += j
+          }
+      }
+      ```
+
+      The payoff is a teardown budget you can state: Done() is already closed when select
+      re-evaluates, so exit costs one scheduling step — not "whenever the next job arrives",
+      which for an idle conclave peer is never. That is what lets every per-peer goroutine
+      in the SFU exit within ONE cancel propagation instead of leaking on quiet connections.
+
+      > [!KEY] close(jobs) says "no more data"; ctx.Done() says "stop now". They are different axes — every blocking receive selects on both, with comma-ok on the data arm.
+  - heading: "defer cancel() is not optional"
+    covers: [go04d-o3]
+    body: |
+      WithTimeout parks a runtime timer and, under a cancelable parent, registers the child
+      in the parent's children set. cancel() releases both in microseconds. Skip it and
+      nothing is released until the DEADLINE fires — or a cancelable parent dies first
+      (cancellation only flows down, so under a long-lived parent there is no earlier
+      exit). A 30 s timeout on a 20 ms request holds dead machinery ~1500x longer than
+      the work took. Bounded, yes — still a leak: at 200 req/s that is ~6,000 live
+      timers+contexts at steady state
+      which one deferred call would keep near zero. This is exactly what go vet's lostcancel
+      check flags when you write `ctx, _ := context.WithTimeout(...)`.
+
+      The rule is unconditional because cancel is idempotent: calling it after the deadline
+      already fired is a harmless no-op and Err() keeps its first cause. So there is no
+      clever path that earns skipping the defer — only the leaky one.
+
+      > [!KEY] defer cancel() on the line after every With* call — it frees the timer and parent registration NOW instead of at the deadline, and extra calls are no-ops.
+
+worked_examples:
+  - id: go04d-w1
+    covers: [go04d-o1]
+    prompt: |
+      ctx comes from context.WithTimeout(context.Background(), 100*time.Millisecond) and
+      cancel() is called at ~10 ms. What do ctx.Err(), errors.Is(ctx.Err(),
+      context.Canceled), and errors.Is(ctx.Err(), context.DeadlineExceeded) report at 5 ms,
+      at 50 ms, and at 200 ms?
+    solution: |
+      5 ms (live): Err() == nil, and both errors.Is checks are false — a nil error matches
+      no sentinel. 50 ms (canceled, deadline not yet reached): Err() == context.Canceled;
+      Is(Canceled) true, Is(DeadlineExceeded) false — cancel() won and the cause is sticky.
+      200 ms (deadline passed): unchanged, still Canceled. cancel() at 10 ms already
+      stopped the parked timer, so the 100 ms deadline never even fired — and a fire
+      racing the cancel would be a no-op on a dead context anyway. First cause wins,
+      forever.
+
+assessments:
+  - id: go04d-a1
+    type: predict_output
+    covers: [go04d-o1]
+    difficulty: easy
+    prompt: |
+      Predict the exact stdout, line by line. The program never sleeps — it waits on
+      <-ctx.Done() — so timing decides WHEN the later lines print, never WHAT they say.
+    grading:
+      strategy: deterministic_output
+      runner: "go run"
+      match: trimmed
+      program: |
+        package main
+
+        import (
+        	"context"
+        	"errors"
+        	"fmt"
+        	"time"
+        )
+
+        func main() {
+        	ctx, cancel := context.WithCancel(context.Background())
+        	fmt.Println("cancel/before:", ctx.Err())
+        	cancel()
+        	<-ctx.Done() // already closed: this never blocks
+        	fmt.Println("cancel/after:", ctx.Err())
+        	fmt.Println("cancel/again:", ctx.Err())
+        	fmt.Println("cancel/is-canceled:", errors.Is(ctx.Err(), context.Canceled))
+
+        	tctx, tcancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+        	defer tcancel() // unconditional, even though the deadline fires first here
+        	fmt.Println("timeout/before:", tctx.Err())
+        	<-tctx.Done() // blocks ~50 ms, until the deadline fires
+        	fmt.Println("timeout/after:", tctx.Err())
+        	fmt.Println("timeout/is-canceled:", errors.Is(tctx.Err(), context.Canceled))
+        	fmt.Println("timeout/is-deadline:", errors.Is(tctx.Err(), context.DeadlineExceeded))
+        }
+      expected_output: |
+        cancel/before: <nil>
+        cancel/after: context canceled
+        cancel/again: context canceled
+        cancel/is-canceled: true
+        timeout/before: <nil>
+        timeout/after: context deadline exceeded
+        timeout/is-canceled: false
+        timeout/is-deadline: true
+
+  - id: go04d-a2
+    type: debug_this
+    covers: [go04d-o2]
+    difficulty: medium
+    prompt: |
+      conclave-shaped: Run is a per-peer worker draining a jobs channel that in production
+      is NEVER closed — teardown arrives by canceling the peer's ctx. Right now cancel does
+      nothing, because the loop only watches jobs. Fix Run so it returns within one cancel
+      propagation, WITHOUT losing drain-to-close (a closed jobs channel must still end the
+      loop with the full sum). Keep the signature.
+    grading:
+      strategy: hidden_tests
+      language: go
+      buggy: |
+        package crucible
+
+        import "context"
+
+        // Run consumes jobs and returns their sum. In production jobs is never
+        // closed; teardown is supposed to arrive through ctx. It does not.
+        func Run(ctx context.Context, jobs <-chan int) int {
+        	sum := 0
+        	for j := range jobs { // no context awareness: exits only on close(jobs)
+        		sum += j
+        	}
+        	return sum
+        }
+      reference_solution: |
+        package crucible
+
+        import "context"
+
+        // Run consumes jobs until ctx is canceled or jobs is closed. Every blocking
+        // receive carries a ctx.Done() arm, so cancellation costs one select
+        // re-evaluation — not "whenever the next job happens to arrive".
+        func Run(ctx context.Context, jobs <-chan int) int {
+        	sum := 0
+        	for {
+        		select {
+        		case <-ctx.Done():
+        			return sum // lifecycle says stop now
+        		case j, ok := <-jobs:
+        			if !ok {
+        				return sum // producer says no more data
+        			}
+        			sum += j
+        		}
+        	}
+        }
+      test_code: |
+        package crucible
+
+        import (
+        	"context"
+        	"testing"
+        	"time"
+        )
+
+        // Detection deadline for "returned promptly": generous so a loaded box cannot
+        // flake it, and tiny next to the 10 s go test -timeout so a hung Run fails THIS
+        // test cleanly instead of killing the whole run.
+        const promptly = 2 * time.Second
+
+        func TestDrainsClosedChannel(t *testing.T) {
+        	jobs := make(chan int, 5)
+        	for i := 1; i <= 5; i++ {
+        		jobs <- i
+        	}
+        	close(jobs)
+        	done := make(chan int, 1)
+        	go func() { done <- Run(context.Background(), jobs) }()
+        	select {
+        	case got := <-done:
+        		if got != 15 {
+        			t.Fatalf("Run = %d, want 15 (a closed jobs channel must still end the loop with the full sum)", got)
+        		}
+        	case <-time.After(promptly):
+        		t.Fatal("Run never returned on a drained, closed channel: the closed-jobs exit path is gone (receiving without comma-ok spins on zero values forever)")
+        	}
+        }
+
+        func TestReturnsPromptlyOnCancel(t *testing.T) {
+        	ctx, cancel := context.WithCancel(context.Background())
+        	defer cancel()
+        	jobs := make(chan int) // NEVER closed: cancellation is the only way out
+        	done := make(chan int, 1)
+        	go func() { done <- Run(ctx, jobs) }()
+        	jobs <- 1 // unbuffered: each send is a rendezvous, so Run holds the value before we move on
+        	jobs <- 2
+        	cancel()
+        	select {
+        	case got := <-done:
+        		if got != 3 {
+        			t.Fatalf("Run = %d, want 3 (both delivered jobs kept, then stop)", got)
+        		}
+        	case <-time.After(promptly):
+        		t.Fatal("Run still blocked 2s after cancel: the receive loop has no ctx.Done() arm")
+        	}
+        }
+
+        func TestAlreadyCanceledReturnsZero(t *testing.T) {
+        	ctx, cancel := context.WithCancel(context.Background())
+        	cancel()
+        	jobs := make(chan int) // empty and never closed
+        	done := make(chan int, 1)
+        	go func() { done <- Run(ctx, jobs) }()
+        	select {
+        	case got := <-done:
+        		if got != 0 {
+        			t.Fatalf("Run = %d, want 0 (no job was ever sent)", got)
+        		}
+        	case <-time.After(promptly):
+        		t.Fatal("Run blocked on an empty channel despite an already-canceled ctx")
+        	}
+        }
+      tests:
+        - { name: TestDrainsClosedChannel,      visible: true,  golden: "close(jobs) still ends the loop with sum 15 — the retrofit must not break drain-to-close" }
+        - { name: TestReturnsPromptlyOnCancel,  visible: true,  golden: "Run returns 3 within the 2 s detection deadline after cancel()" }
+        - { name: TestAlreadyCanceledReturnsZero, visible: false, golden: "a ctx canceled before Run starts returns 0 immediately, with zero jobs pending" }
+      race: true
+      timeout_ms: 10000
+
+  - id: go04d-a3
+    type: mcq
+    covers: [go04d-o3]
+    difficulty: medium
+    prompt: |
+      On a request path that normally finishes in ~20 ms you write
+
+      ```go
+      ctx, _ := context.WithTimeout(parentCtx, 30*time.Second)
+      ```
+
+      discarding the CancelFunc. parentCtx is the server's app-lifetime context — cancelable,
+      but canceled only at shutdown, so nothing upstream dies while requests flow. What
+      actually leaks, and for how long?
+    grading:
+      strategy: deterministic_choice
+      options:
+        - text: "Nothing: the moment the handler returns, the ctx is unreachable and the GC reclaims it along with its timer"
+          correct: false
+          why: "The runtime timer heap and the parent's children set still reference the timer ctx, so it is NOT unreachable — GC cannot touch it until the deadline fires at 30 s. go vet's lostcancel check exists precisely because this is not a GC problem."
+        - text: "The deadline timer plus the ctx's registration in its parent stay live until the 30 s deadline fires — ~1500x longer than the 20 ms request that created them"
+          correct: true
+          why: "cancel() releases both in microseconds; without it each call parks them for the full 30 s. At 200 req/s that is ~6,000 live timers+contexts at steady state that one deferred call would keep near zero."
+        - text: "The key/value pairs stored along the ctx chain leak permanently"
+          correct: false
+          why: "Values are plain references up the parent chain and die with it — wrong on both counts: the leak is the timer machinery, and it is bounded by the deadline, not permanent."
+        - text: "Any goroutine waiting on <-ctx.Done() is stranded forever"
+          correct: false
+          why: "Done() still closes when the deadline fires, so a correct waiter wakes at 30 s regardless. A missing cancel delays cleanup by up to the deadline; it never strands a waiter that trusts Done()."
+    reference_answer: "The deadline timer plus the ctx's registration in its parent stay live until the 30 s deadline fires — ~1500x longer than the 20 ms request that created them"
+
+  - id: go04d-a4
+    type: explain_tradeoff
+    covers: [go04d-o3]
+    difficulty: hard
+    prompt: |
+      In writing: defend the house rule — `ctx, cancel := context.WithTimeout(parent, d)`
+      immediately followed by `defer cancel()` — against BOTH rejected alternatives:
+      (a) skipping cancel because "the deadline fires anyway", (b) replacing context with a
+      hand-rolled close(quit) broadcast channel for conclave's per-peer teardown. Name each
+      one's concrete failure mode and include at least one number.
+    grading:
+      strategy: llm_judge
+      judge_mode: rubric
+      rubric:
+        pass_threshold: 0.6
+        criteria:
+          - { id: c1, weight: 0.4, text: "Names both rejected alternatives and WHY each is wrong (deadline-as-cleanup leaks until expiry; a quit channel loses deadlines + sticky cause and is not idempotent)" }
+          - { id: c2, weight: 0.3, text: "States a concrete failure mode: timers/contexts accumulating on a hot path, or panic: close of closed channel when two teardown paths race" }
+          - { id: c3, weight: 0.3, text: "Includes a quantified claim (held-duration ratio, steady-state timer count, or cancel's release cost)" }
+        anti_reward_hacking: { min_words: 40, penalize_if_contains: ["as an AI", "it depends"] }
+    reference_answer: |
+      defer cancel() is unconditional because cancel is the one lever this function holds
+      that releases the deadline timer and the child's registration in its parent BEFORE
+      the deadline — and it
+      is idempotent, so the defer costs nothing on the path where the timer already fired.
+      (a) "Skip it, the deadline fires anyway" turns every call into a bounded leak: a 30 s
+      timeout on a 20 ms request holds a live timer + context ~1500x longer than the work
+      took, and at 200 req/s that is ~6,000 parked timers+contexts at steady state — go
+      vet's lostcancel flags exactly this. (b) A hand-rolled close(quit) broadcast loses the
+      deadline integration and the sticky Err() that tells callers WHY they stopped
+      (Canceled vs DeadlineExceeded), has to be re-plumbed through every API layer that
+      already accepts a ctx, and close is not idempotent: two teardown paths racing to
+      close(quit) — an easy accident in conclave, where both the signaling layer and the SFU
+      migration can decide a peer is dead — is panic: close of closed channel, where racing
+      cancel() calls are a safe no-op.
+
+limitations: >
+  The promptness debug_this proves is "returned within a 2 s detection deadline", not a
+  measured propagation latency — no p50/p99 of cancel-to-return is collected here. The
+  predict_output program is deterministic in WHAT it prints, but printing "timeout/before"
+  ahead of a 50 ms deadline is a scheduling assumption a pathologically loaded box could
+  break. The MCQ's leak numbers (30 s hold, ~6,000 at 200 req/s) come from reading the
+  runtime's timer/children bookkeeping, not from a live-heap measurement in this harness.
+  And -race green remains a probabilistic absence of observed races (R4); this lesson covers
+  cancellation semantics only — not context values, Cause, or AfterFunc, and not the memory
+  model (go05c).

@@ -1,0 +1,470 @@
+# Pilot lesson 7 — authored per content/go/PILOT-CONVENTIONS.md; verify: make verify ID=go04g-mini-errgroup
+schema_version: 1
+id: go04g-mini-errgroup
+tag: go04g
+title: "Go: build a mini-errgroup — fan-out, first error wins, everyone finishes"
+track: go
+week: "Track Go · Module 04/05 (pilot) · Lesson 7"
+priority: attack
+content_rev: 1
+toolchain: { go: "1.26" }
+prerequisites: [go04f-worker-pool]
+altitude: ramp
+summary: >
+  Fan out N tasks, fail the round on the first error, but never abandon a task mid-cleanup —
+  conclave's bootstrap dial round in one sentence. In production Go this shape belongs to
+  golang.org/x/sync/errgroup; the runner bans it (GOPROXY=off), which is exactly the point:
+  the 20-line core teaches the two ideas the import hides. Completion belongs to a WaitGroup;
+  first-error capture is a synchronized latch (sync.Once), never a bare shared variable. You
+  have built first-failure aggregation before — Go's twist is that the memory model, not a
+  code review, decides which spelling is broken.
+
+learning_objectives:
+  - { id: go04g-o1, bloom: create,   text: "Implement Group{Go, Wait} with a first-error-wins latch that is -race clean and never abandons a started goroutine" }
+  - { id: go04g-o2, bloom: analyze,  text: "Explain why WaitGroup + a bare shared err variable races, and why a mis-drained error channel parks senders or deadlocks the round" }
+  - { id: go04g-o3, bloom: evaluate, text: "Select Group vs bare WaitGroup vs cap-N error channel for a task shape, from what the code does with failures" }
+
+teach:
+  - heading: "Two obvious implementations, two different failure modes"
+    covers: [go04g-o2]
+    body: |
+      The shape: launch N dialers, every one must finish (sockets to release), and the first
+      non-nil error is the round's verdict. Two "obvious" stdlib spellings are broken:
+
+      Wrong #1 — WaitGroup + shared variable:
+
+      ```go
+      if firstErr == nil { // unsynchronized read...
+      	firstErr = err   // ...then write, from N goroutines
+      }
+      ```
+
+      Check-then-assign from N goroutines with no lock: `go test -race` prints a read/write
+      pair on firstErr between two dialer goroutines. The subtlety that lets this survive
+      review: wg.Wait() DOES make main's final read safe (Done→Wait is a happens-before
+      edge) — but it orders dialers against main, never dialers against each other.
+
+      Wrong #2 — err = <-errCh: with an unbuffered channel and a single receive, every
+      failing dialer after the first parks forever inside `errCh <- err`. A parked dialer
+      never reaches its deferred wg.Done(), so with k >= 2 failures the counter never hits 0
+      and wg.Wait() deadlocks the whole round. Buffering to cap N fixes the parking; then a
+      bare receive still deadlocks the zero-failure round (nothing was ever sent), so you
+      need select-with-default plus drain arithmetic. All of it is avoidable.
+
+      > [!KEY] Completion and first-error are two jobs: a WaitGroup owns "everyone finished"; a synchronized latch (sync.Once or a Mutex) owns "who failed first". Never a bare shared variable.
+  - heading: "The 20-line Group: WaitGroup for completion, Once as the error latch"
+    covers: [go04g-o1]
+    body: |
+      Three fields and two rules:
+
+      ```go
+      type Group struct {
+      	wg   sync.WaitGroup
+      	once sync.Once
+      	err  error
+      }
+      ```
+
+      Rule 1 — Go(f) calls wg.Add(1) in the CALLER's goroutine, then launches a wrapper:
+      defer wg.Done(); run f; on a non-nil error, once.Do a closure that assigns g.err.
+      Add inside the wrapper is the classic misuse: it runs concurrently with Wait, which
+      can observe counter 0 before any Add lands and return early.
+
+      Rule 2 — Wait() is just wg.Wait(); return g.err — no lock around the read. The
+      lockless read is sound because the winning goroutine writes g.err before its
+      wg.Done() (program order), and wg.Wait() returns only after every Done: the write
+      happens-before the read. Concurrent losers are Once's problem: exactly one closure
+      runs; later callers return without touching g.err.
+
+      A Mutex latch (lock; if err == nil, assign; unlock) is equally correct — Once just
+      states "exactly one winner" in the type. This wg+once+err triple is verbatim the core
+      of x/sync/errgroup; the real one adds WithContext, which cancels a shared context
+      inside that same once so sibling tasks can stop early instead of running to completion.
+
+      > [!KEY] err is written before wg.Done() and read after wg.Wait() returns — that Done→Wait happens-before edge is the entire safety argument for the lockless read.
+  - heading: "Which completion shape, when"
+    covers: [go04g-o3]
+    body: |
+      Match the machinery to what the code DOES with failures:
+
+      - First failure is the verdict, all must finish → this Group (x/sync/errgroup in real
+        code, once you also want cancellation). conclave's bootstrap dial round: 8 STUN/TURN
+        candidates, one refusal fails the round, every dialer still releases its socket.
+      - Tasks cannot fail, or failures are recorded rather than returned → bare WaitGroup
+        and nothing else. conclave's upload-meter samplers each store into an atomic; an
+        error latch there is a field plus a branch documenting a path that cannot happen.
+      - You need ALL k errors, not one → results channel with cap N (one slot per task, so
+        a sender can never park) drained to completion, then errors.Join — or a
+        mutex-guarded slice. A first-error latch here silently discards k-1 of the
+        diagnoses you were asked to report.
+
+      > [!KEY] First error → Group. No errors → WaitGroup. All errors → cap-N channel (or mutex+slice) + errors.Join.
+
+worked_examples:
+  - id: go04g-w1
+    covers: [go04g-o2]
+    prompt: |
+      A teammate "fixes" Wrong #1 by switching to a channel:
+
+      ```go
+      errCh := make(chan error) // unbuffered
+      // each dialer, on failure: errCh <- err
+      // main, after launching all dialers:
+      wg.Wait()
+      var first error
+      select {
+      case first = <-errCh:
+      default:
+      }
+      ```
+
+      4 dialers run; 2 fail. Walk through exactly what happens, then name the smallest
+      change that makes this ordering safe.
+    solution: |
+      Both failing dialers park inside `errCh <- err` — an unbuffered send has no receiver
+      until after wg.Wait(). Parked mid-body, they never reach their deferred wg.Done(), so
+      the counter sticks at 2, wg.Wait() never returns, the select is unreachable, and the
+      runtime kills the process: `fatal error: all goroutines are asleep - deadlock!`.
+      Smallest safe change: `make(chan error, 4)` — one slot per dialer means no send can
+      ever park, wg.Wait() completes, and select-with-default reads the first buffered
+      failure (with 0 failures the default arm fires). The second buffered error is
+      dropped, which is exactly the first-error contract — the Group buys the same behavior
+      without capacity arithmetic that must track N.
+
+assessments:
+  - id: go04g-a1
+    type: mcq
+    covers: [go04g-o2]
+    difficulty: medium
+    prompt: |
+      conclave's bootstrap, as first written: 4 dial candidates fan out; the round keeps
+      only the first failure.
+
+      ```go
+      var wg sync.WaitGroup
+      var firstErr error
+      for _, c := range candidates { // 4 candidates
+      	wg.Add(1)
+      	go func() {
+      		defer wg.Done()
+      		if err := dial(c); err != nil {
+      			if firstErr == nil { // keep the first failure only
+      				firstErr = err
+      			}
+      		}
+      	}()
+      }
+      wg.Wait()
+      return firstErr
+      ```
+
+      Two candidates are down. What does `go test -race` report, and why?
+    grading:
+      strategy: deterministic_choice
+      options:
+        - text: "A read/write race on firstErr between two dialer goroutines — the nil-check and the assignment have no happens-before edge between failing dialers"
+          correct: true
+          why: "Both failing dialers run check-then-assign concurrently; nothing orders one dialer's write against another's read. This is the exact pair -race prints: Read at 0x... by goroutine N / Previous write at 0x... by goroutine M."
+        - text: "Nothing: wg.Wait() synchronizes everything, so the final read of firstErr is safe and the pattern is race-free"
+          correct: false
+          why: "Half-right in the dangerous way: Done→Wait does make MAIN's read safe — but that edge orders dialers against main, not dialers against each other. The writer-vs-reader races among the dialers remain and are what -race reports."
+        - text: "A race on the WaitGroup itself: wg.Add runs in the loop while wg.Wait may run concurrently in main"
+          correct: false
+          why: "All four Adds and the Wait run in the SAME goroutine, so program order sequences them — no concurrency, no race. (Moving Add inside the spawned goroutine WOULD be that bug; it is not this code.)"
+        - text: "Only a warning, not a race: every dialer writes the same kind of value, so the writes are benign and -race downgrades them"
+          correct: false
+          why: "Go has no benign-data-race category: any unsynchronized conflicting access is a full WARNING: DATA RACE, same-value or not. -race can MISS a race it never observes (R4), but it never downgrades one it sees."
+    reference_answer: "A read/write race on firstErr between two dialer goroutines — the nil-check and the assignment have no happens-before edge between failing dialers"
+
+  - id: go04g-a2
+    type: predict_race_verdict
+    covers: [go04g-o2]
+    difficulty: easy
+    prompt: |
+      conclave's first-draft bootstrap capture, isolated and run hot: 4 dialers all fail,
+      released together by a start barrier, 100 capture attempts each. Before answering,
+      name the conflicting access pair and the edge (if any) that orders one dialer
+      against another. Then call it: race or clean?
+    grading:
+      strategy: deterministic_output
+      runner: "go build -race"
+      iterations: 50
+      confidence: probabilistic
+      expected_verdict: race
+      program: |
+        package main
+
+        import (
+        	"fmt"
+        	"sync"
+        )
+
+        // conclave's first-draft bootstrap capture, isolated and made hot: a start
+        // barrier releases the 4 dialers together and each runs its capture attempt
+        // 100 times against one shared firstErr.
+        func main() {
+        	var wg sync.WaitGroup
+        	var firstErr error
+        	start := make(chan struct{})
+        	for d := 0; d < 4; d++ {
+        		wg.Add(1)
+        		go func() {
+        			defer wg.Done()
+        			<-start // barrier: all four dialers released together
+        			for i := 0; i < 100; i++ {
+        				if firstErr == nil { // keep the first failure only
+        					firstErr = fmt.Errorf("dial candidate: connection refused")
+        				}
+        			}
+        		}()
+        	}
+        	close(start)
+        	wg.Wait()
+        	fmt.Println("round failed:", firstErr != nil)
+        }
+
+  - id: go04g-a3
+    type: code_from_scratch
+    covers: [go04g-o1]
+    difficulty: hard
+    prompt: |
+      Build the primitive x/sync/errgroup is famous for — stdlib only (the runner sets
+      GOPROXY=off, so the import is not even possible; that is the point). Implement Group
+      so that Go(f) runs f on its own goroutine, and Wait() blocks until ALL started
+      functions return, then returns the FIRST non-nil error any of them produced (nil if
+      none did). It must be -race clean under concurrent failures and must never abandon a
+      still-running function. Keep the exported API exactly Group, (*Group).Go,
+      (*Group).Wait.
+    grading:
+      strategy: hidden_tests
+      language: go
+      starter: |
+        package crucible
+
+        // Group is a mini-errgroup. Go(f) fans out; Wait() returns the FIRST non-nil
+        // error while still waiting for ALL started functions to finish.
+        //
+        // You need two pieces of state: something that owns completion ("every
+        // started function has returned") and a latch that captures exactly one
+        // error under concurrent failures. sync.WaitGroup + sync.Once is the
+        // cleanest pairing; a sync.Mutex latch works too — behavior is graded,
+        // not implementation.
+        type Group struct {
+        	// TODO: completion + first-error latch.
+        }
+
+        // Go runs f in its own goroutine and registers it with the group.
+        // Register with the completion state HERE, in the caller's goroutine —
+        // registering inside the spawned goroutine runs concurrently with Wait.
+        func (g *Group) Go(f func() error) {
+        	_ = f // TODO: fan out; capture a non-nil result exactly once.
+        }
+
+        // Wait blocks until every function started with Go has returned, then
+        // returns the first captured error, or nil if every function succeeded.
+        func (g *Group) Wait() error {
+        	return nil // TODO
+        }
+      reference_solution: |
+        package crucible
+
+        import "sync"
+
+        // Group is a mini-errgroup: completion owned by a WaitGroup, first error
+        // captured by a Once latch. This is the core of x/sync/errgroup minus
+        // context cancellation.
+        type Group struct {
+        	wg   sync.WaitGroup
+        	once sync.Once
+        	err  error
+        }
+
+        // Go runs f in its own goroutine and registers it with the group. Add runs
+        // here, in the caller's goroutine: Add concurrent with Wait is a WaitGroup
+        // misuse, and program order makes this placement safe.
+        func (g *Group) Go(f func() error) {
+        	g.wg.Add(1)
+        	go func() {
+        		defer g.wg.Done()
+        		if err := f(); err != nil {
+        			// Exactly one writer wins; later failures are no-ops. The
+        			// lockless read in Wait is safe because err is written before
+        			// wg.Done() and read after wg.Wait() — a happens-before edge.
+        			g.once.Do(func() { g.err = err })
+        		}
+        	}()
+        }
+
+        // Wait blocks until every function started with Go has returned, then
+        // returns the first captured error, or nil if every function succeeded.
+        func (g *Group) Wait() error {
+        	g.wg.Wait()
+        	return g.err
+        }
+      test_code: |
+        package crucible
+
+        import (
+        	"errors"
+        	"sync/atomic"
+        	"testing"
+        	"time"
+        )
+
+        // Deadline for "a blocking wait must eventually deliver" checks — generous
+        // so a loaded box cannot flake it (PILOT-CONVENTIONS: ~2 s).
+        const testDeadline = 2 * time.Second
+
+        func TestAllSucceed(t *testing.T) {
+        	var g Group
+        	var ran atomic.Int64
+        	const n = 8
+        	for i := 0; i < n; i++ {
+        		g.Go(func() error {
+        			ran.Add(1)
+        			return nil
+        		})
+        	}
+        	if err := g.Wait(); err != nil {
+        		t.Fatalf("Wait = %v, want nil when every function succeeds", err)
+        	}
+        	if got := ran.Load(); got != int64(n) {
+        		t.Fatalf("only %d of %d functions ran — Go must start every f", got, n)
+        	}
+        }
+
+        func TestFirstErrorWins(t *testing.T) {
+        	var g Group
+        	start := make(chan struct{})
+        	submitted := []error{
+        		errors.New("dial stun0: i/o timeout"),
+        		errors.New("dial stun1: connection refused"),
+        		errors.New("dial turn0: 401 unauthorized"),
+        	}
+        	for _, e := range submitted {
+        		g.Go(func() error {
+        			<-start // barrier: the three failures race to be captured
+        			return e
+        		})
+        	}
+        	for i := 0; i < 5; i++ {
+        		g.Go(func() error {
+        			<-start
+        			return nil
+        		})
+        	}
+        	close(start)
+        	got := g.Wait()
+        	if got == nil {
+        		t.Fatal("Wait = nil, but 3 of 8 functions returned an error")
+        	}
+        	// Which failure wins is scheduling-dependent — any submitted error is
+        	// a correct answer; asserting a specific one would be unsound.
+        	for _, e := range submitted {
+        		if errors.Is(got, e) {
+        			return
+        		}
+        	}
+        	t.Fatalf("Wait = %v, which is not one of the 3 submitted errors", got)
+        }
+
+        func TestWaitsForAll(t *testing.T) {
+        	var g Group
+        	var slowFinished atomic.Bool
+        	release := make(chan struct{})
+        	errBoom := errors.New("fast candidate: connection refused")
+        	g.Go(func() error {
+        		return errBoom // fails immediately
+        	})
+        	g.Go(func() error {
+        		<-release // provably unfinished until the test says so
+        		slowFinished.Store(true)
+        		return nil
+        	})
+        	waitDone := make(chan error, 1)
+        	go func() { waitDone <- g.Wait() }()
+        	// A correct Wait CANNOT return yet: the slow function is parked on
+        	// release, which is still open. The 100 ms window below exists only to
+        	// catch a Wait that returns on first error; correct code never sends in
+        	// this window, so the window cannot flake a correct solution.
+        	select {
+        	case err := <-waitDone:
+        		t.Fatalf("Wait returned %v while a started function was still running — the first error must not abandon in-flight goroutines", err)
+        	case <-time.After(100 * time.Millisecond):
+        	}
+        	close(release)
+        	select {
+        	case err := <-waitDone:
+        		if !slowFinished.Load() {
+        			t.Fatal("Wait returned before the slow function finished")
+        		}
+        		if !errors.Is(err, errBoom) {
+        			t.Fatalf("Wait = %v, want the one submitted error %v", err, errBoom)
+        		}
+        	case <-time.After(testDeadline):
+        		t.Fatal("Wait did not return within 2s after every function finished")
+        	}
+        }
+      tests:
+        - { name: TestAllSucceed,     visible: true,  golden: "Wait returns nil after all 8 succeed; an atomic count proves every f actually ran" }
+        - { name: TestFirstErrorWins, visible: false, golden: "with 3 concurrent failures behind a barrier, Wait returns one of the submitted errors, never nil" }
+        - { name: TestWaitsForAll,    visible: false, golden: "Wait blocks while a slow success is in flight and still reports the early error after it finishes" }
+      race: true
+      timeout_ms: 10000
+
+  - id: go04g-a4
+    type: explain_tradeoff
+    covers: [go04g-o3]
+    difficulty: hard
+    prompt: |
+      In writing, assign the completion+failure machinery for three conclave-shaped
+      fan-outs, and defend the first choice against both rejected alternatives:
+
+      (a) bootstrap dial round — 8 STUN/TURN candidates dialed concurrently; the first
+          failure decides the round, but every dialer must still release its socket before
+          the next round may start;
+      (b) upload-meter sampling — one sampler per peer, each stores a reading into an
+          atomic; a sampler cannot fail;
+      (c) candidate validation — the operator report must list EVERY failing candidate,
+          not just the first.
+
+      For (a), name both rejected alternatives (bare WaitGroup + shared err variable;
+      single-receive error channel), give each one's concrete failure mode, and include at
+      least one number somewhere in your answer.
+    grading:
+      strategy: llm_judge
+      judge_mode: rubric
+      rubric:
+        pass_threshold: 0.6
+        criteria:
+          - { id: c1, weight: 0.4, text: "Correct primitive per shape — (a) Group/errgroup-shape, (b) bare WaitGroup with no error latch, (c) cap-N channel or mutex+slice collected via errors.Join — and names both rejected alternatives for (a)" }
+          - { id: c2, weight: 0.3, text: "Concrete failure modes: -race read/write report on the shared err variable; parked senders leaking goroutines or a zero-failure/mis-drained deadlock on the channel; first-error latch discarding the other k-1 diagnoses in (c)" }
+          - { id: c3, weight: 0.3, text: "Includes a quantified claim (leaked-goroutine count, ~KB per parked goroutine, buffer-capacity arithmetic, or a measured overhead/trip-rate number)" }
+        anti_reward_hacking: { min_words: 40, penalize_if_contains: ["as an AI", "it depends"] }
+    reference_answer: |
+      (a) is the errgroup shape — the first non-nil error is the verdict, completion is
+      all-8 — so: a Group with a WaitGroup for completion and a sync.Once latch for the
+      error (x/sync/errgroup itself once cancellation via context is also wanted).
+      Rejected: bare WaitGroup + shared err is an unsynchronized check-then-assign, and go
+      test -race prints a read/write pair on the err variable between two failing dialers;
+      a single-receive unbuffered error channel parks every failing dialer after the first
+      inside its send — with k=3 failures that is 2 goroutines (~2 KB of initial stack
+      each) parked mid-cleanup, their deferred wg.Done() never runs, and the round
+      deadlocks; with 0 failures the bare receive deadlocks instead. (b) samplers cannot
+      fail, so a bare WaitGroup is the complete answer; an error latch adds a field and a
+      branch that document a failure path that cannot happen. (c) needs all k errors: a
+      results channel with cap 8 — one slot per candidate, so no sender can ever park —
+      drained to completion and folded with errors.Join (or a mutex-guarded slice). A
+      first-error latch there throws away k-1 of the k diagnoses the operator asked for.
+
+limitations: >
+  TestFirstErrorWins proves Wait returns SOME submitted error, not WHICH one — under truly
+  concurrent failures "first" is unobservable from outside, so an always-overwrite mutex
+  latch passes these behavioral tests too (its observable contract is identical).
+  TestWaitsForAll's 100 ms window catches an early-returning Wait with near-certainty, not
+  certainty: a wrong implementation that dawdles longer than 100 ms before returning would
+  slip through, while correct code cannot flake the window in either direction by
+  construction. A green -race run remains a probabilistic absence of observed races (R4).
+  And this Group deliberately omits errgroup's WithContext and SetLimit — after a failure,
+  sibling tasks here run to completion rather than being cancelled, which is exactly the
+  gap x/sync/errgroup's context integration exists to close.

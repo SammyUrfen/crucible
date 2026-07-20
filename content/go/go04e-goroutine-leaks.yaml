@@ -1,0 +1,385 @@
+# Pilot lesson — authored per content/go/PILOT-CONVENTIONS.md; verify: make verify ID=go04e-goroutine-leaks
+schema_version: 1
+id: go04e-goroutine-leaks
+tag: go04e
+title: "Go: goroutine leaks — the blocked sender you forgot about"
+track: go
+week: "Track Go · Module 04 (pilot) · Lesson 5"
+priority: attack
+content_rev: 1
+toolchain: { go: "1.26" }
+prerequisites: [go04d-context-cancellation]
+altitude: ramp
+summary: >
+  You already run leak-free lifecycles in conclave — context to order the stop, WaitGroup to
+  prove it. This lesson is the leak that discipline misses: a helper goroutine sends its result
+  to a caller that stopped listening (timeout, early return), and the send blocks forever.
+  Nothing crashes; the worker just parks in [chan send], and under peer churn "forever"
+  compounds without bound. You will diagnose it from the runtime's own dump, fix it with a
+  single-slot buffer and prove the fix by counting goroutines — plus one calibration update:
+  the loop-variable capture bug the internet still warns about died in Go 1.22.
+
+learning_objectives:
+  - { id: go04e-o1, bloom: analyze, text: "Diagnose from a goroutine dump WHY a blocked sender can never exit nor be collected once its receiver has abandoned it" }
+  - { id: go04e-o2, bloom: create,  text: "Fix the timeout-wrapper leak with a cap-1 result channel, proven by a runtime.NumGoroutine drain assertion" }
+  - { id: go04e-o3, bloom: analyze, text: "State Go 1.22+ per-iteration loop-variable semantics and predict the output of goroutines capturing the loop variable" }
+
+teach:
+  - heading: "the canonical leak: a sender whose receiver already left"
+    covers: [go04e-o1]
+    body: |
+      The canonical Go leak needs no crash and no lock — just a result nobody collects.
+      conclave shape: an SFU stats prober per peer, wrapped with a 100 ms deadline:
+
+      ```go
+      ch := make(chan int)          // unbuffered: this send NEEDS a listening receiver
+      go func() { ch <- probe() }() // worker
+      select {
+      case v := <-ch:               // happy path: rendezvous works
+      	use(v)
+      case <-ctx.Done():            // timeout path: the caller leaves...
+      	return                    // ...and the worker parks in [chan send] FOREVER
+      }
+      ```
+
+      The runtime states the verdict itself: a SIGQUIT or pprof goroutine dump prints
+      `goroutine 4242 [chan send, 63 minutes]`. No receiver can ever arrive (the only one
+      returned an hour ago), so the scheduler will never make it runnable again — and the GC
+      will never collect it either.
+
+      > [!KEY] A leaked goroutine is not garbage: a blocked goroutine is a GC root — its 2 KB stack, its channel, and the result it holds stay live forever.
+
+      Do the conclave arithmetic: peers churn every ~5 s, one leaked prober per timed-out
+      probe → 720/hour ≈ 17,000/day; at the 2 KB minimum stack that is ~34 MB/day pinned
+      before counting channels and captured results. No panic, no error — just
+      runtime.NumGoroutine() climbing while CPU and traffic stay flat.
+  - heading: "two fixes, one decision — and how to prove either"
+    covers: [go04e-o2]
+    body: |
+      Fix A — give the result channel capacity 1:
+
+      ```go
+      ch := make(chan int, 1) // the send ALWAYS completes; the worker exits either way
+      go func() { ch <- probe() }()
+      ```
+
+      Fire-and-forget: the worker cannot block on delivery no matter how the caller leaves —
+      leak-freedom by construction, cost one buffered slot (8 bytes for an int). An abandoned
+      result is collected with its channel the moment both are unreachable. Fix B — make the
+      send itself cancellable:
+
+      ```go
+      select {
+      case ch <- probe():
+      case <-ctx.Done(): // the same cancel that freed the caller frees the worker
+      }
+      ```
+
+      Decision rule: for quick work whose result may be abandoned (a sub-100 ms probe), cap-1
+      — zero plumbing. When the work itself is long or expensive, plumb ctx into the worker
+      (fix B plus ctx checks inside the work); note the select's send arm evaluates probe()
+      BEFORE parking, so fix B alone never saves the computation — only the goroutine.
+
+      Proving it: leaks hide in a global count, so the test discipline is (1) baseline :=
+      runtime.NumGoroutine() at test start, (2) drive the leaky path N=10 times so the signal
+      beats background-goroutine noise, (3) retry-loop up to ~2 s waiting for the count to
+      drain back to baseline — goroutine exit is asynchronous, so asserting instantly (or
+      after one sleep) is a flake. And no t.Parallel anywhere in a file that counts
+      goroutines: a sibling test's spawns would corrupt the baseline.
+  - heading: "Go 1.22+ loop variables: distrust answers older than Feb 2024"
+    covers: [go04e-o3]
+    body: |
+      Before Go 1.22, every iteration of a loop shared ONE loop variable; goroutines launched
+      from the loop captured that single variable, the lore answer to "what does this print"
+      was 3 3 3, and the ritual fix was the `i := i` shadow copy. Since Go 1.22 (Feb 2024)
+      each iteration declares a FRESH variable: a goroutine capturing i sees that iteration's
+      value, and the shadow copy is dead ceremony. The semantics key off the module's go.mod
+      `go` line, not the installed toolchain — a module still pinned to `go 1.21` keeps the
+      old shared-variable capture even when built with the 1.26 toolchain, so read go.mod
+      before you diagnose.
+
+      > [!KEY] Since Go 1.22 each loop iteration gets its own variable — an internet answer from before Feb 2024 describes a language that no longer exists.
+
+worked_examples:
+  - id: go04e-w1
+    covers: [go04e-o1]
+    prompt: |
+      A conclave soak run shows runtime.NumGoroutine() climbing ~720/hour while CPU and media
+      traffic stay flat. `kill -QUIT` prints hundreds of stacks like:
+
+      ```
+      goroutine 4242 [chan send, 63 minutes]:
+      main.probePeer(...)
+      ```
+
+      Walk through why goroutine 4242 can never exit — and why waiting will not help.
+    solution: |
+      `[chan send]` names the exact park reason: blocked in `ch <- value` with no ready
+      receiver. Its only-ever receiver was the timeout wrapper that created it, and that
+      caller returned on ctx.Done() 63 minutes ago; no other goroutine holds the channel, so
+      no receive can ever arrive and the scheduler will never run 4242 again. The GC cannot
+      help: a blocked goroutine is a root, so its 2 KB stack, the channel, and the pending
+      value all stay reachable — 720/hour of these ≈ 34 MB/day in stacks alone. The fix is
+      upstream in the wrapper, not in this goroutine: a cap-1 result channel (send always
+      completes) or a ctx-aware select around the send.
+
+assessments:
+  - id: go04e-a1
+    type: mcq
+    covers: [go04e-o1]
+    difficulty: medium
+    prompt: |
+      conclave's per-peer stats probe, wrapped four ways. Each option states both the worker
+      and its caller in full; where a deadline appears it is 100 ms. Which pattern LEAKS the
+      worker goroutine?
+    grading:
+      strategy: deterministic_choice
+      options:
+        - text: "Unbuffered ch := make(chan int); worker runs ch <- probe(); caller selects on ch vs ctx.Done() and returns on timeout"
+          correct: true
+          why: "After the caller returns there is no receiver and none can ever arrive — the worker parks in [chan send] forever. Each timeout pins ~2 KB of stack plus the channel and the result; under 5 s peer churn that is 720 leaked probers/hour."
+        - text: "ch := make(chan int, 1); worker runs ch <- probe(); caller selects on ch vs ctx.Done() and returns on timeout"
+          correct: false
+          why: "The cap-1 send completes whether or not anyone still listens, so the worker exits; the abandoned channel and result become unreachable and are GC'd. This is the fire-and-forget fix, at the cost of one buffered slot."
+        - text: "Unbuffered ch; worker runs select { case ch <- probe(): case <-ctx.Done(): }; caller selects on ch vs ctx.Done() and returns on timeout"
+          correct: false
+          why: "No leak: cancellation unblocks the send arm, so the same signal that made the caller leave releases the worker. Cost is plumbing ctx into the worker — and probe() still runs to completion, because a select's send arm evaluates its value before parking."
+        - text: "Worker sends N stats then close(ch); caller drains with for v := range ch to the close — no deadline on this path"
+          correct: false
+          why: "range exits when the owning sender closes — the go04a ownership contract, and nobody is left blocked. The boundary matters: had a deadline abandoned the range mid-stream, these unbuffered sends WOULD leak; draining to the close is exactly what makes the pattern safe."
+    reference_answer: "Unbuffered ch := make(chan int); worker runs ch <- probe(); caller selects on ch vs ctx.Done() and returns on timeout"
+
+  - id: go04e-a2
+    type: predict_output
+    covers: [go04e-o3]
+    difficulty: easy
+    prompt: |
+      This module's go.mod pins `go 1.26`. Predict the exact stdout (one line).
+    grading:
+      strategy: deterministic_output
+      runner: "go run"
+      match: trimmed
+      program: |
+        package main
+
+        import (
+        	"fmt"
+        	"sort"
+        	"sync"
+        )
+
+        func main() {
+        	var (
+        		mu   sync.Mutex
+        		seen []int
+        	)
+        	var wg sync.WaitGroup
+        	for i := 0; i < 3; i++ {
+        		wg.Add(1)
+        		go func() {
+        			defer wg.Done()
+        			mu.Lock()
+        			seen = append(seen, i) // captures the loop variable itself
+        			mu.Unlock()
+        		}()
+        	}
+        	wg.Wait()
+        	sort.Ints(seen)
+        	fmt.Println(seen)
+        }
+      expected_output: |
+        [0 1 2]
+
+  - id: go04e-a3
+    type: debug_this
+    covers: [go04e-o1, go04e-o2]
+    difficulty: medium
+    prompt: |
+      conclave's per-peer stats-probe wrapper. Staging shows runtime.NumGoroutine() climbing
+      by one for every probe that times out, and the dump says [chan send]. Fix FirstResult so
+      an abandoned worker still exits — keep the signature, the delivered result on the happy
+      path, and a prompt ctx.Err() on timeout, including a timeout that fires mid-work. Hidden
+      tests count goroutines before and after a batch of probes that all time out.
+    grading:
+      strategy: hidden_tests
+      language: go
+      buggy: |
+        package crucible
+
+        import "context"
+
+        // FirstResult runs work in its own goroutine and returns its value, unless
+        // ctx expires first -- conclave's per-peer stats probe with a deadline.
+        // The happy path is fine. Think about where the worker is one hour after
+        // a timeout.
+        func FirstResult(ctx context.Context, work func() int) (int, error) {
+        	ch := make(chan int)
+        	go func() {
+        		ch <- work()
+        	}()
+        	select {
+        	case v := <-ch:
+        		return v, nil
+        	case <-ctx.Done():
+        		return 0, ctx.Err()
+        	}
+        }
+      reference_solution: |
+        package crucible
+
+        import "context"
+
+        // FirstResult runs work in its own goroutine and returns its value, unless
+        // ctx expires first -- conclave's per-peer stats probe with a deadline.
+        //
+        // cap 1: the worker's send always completes even after the caller has gone,
+        // so the worker exits and an abandoned channel+result are simply GC'd.
+        func FirstResult(ctx context.Context, work func() int) (int, error) {
+        	ch := make(chan int, 1)
+        	go func() {
+        		ch <- work()
+        	}()
+        	select {
+        	case v := <-ch:
+        		return v, nil
+        	case <-ctx.Done():
+        		return 0, ctx.Err()
+        	}
+        }
+      test_code: |
+        package crucible
+
+        import (
+        	"context"
+        	"runtime"
+        	"testing"
+        	"time"
+        )
+
+        // leakCalls: enough abandoned wrappers that a real leak is unambiguous
+        // against background goroutine-count noise (one would hide in the jitter).
+        const leakCalls = 10
+
+        // drainDeadline: goroutine exit is asynchronous -- poll with a generous
+        // deadline instead of asserting instantly (or sleeping once and hoping).
+        const drainDeadline = 2 * time.Second
+
+        func TestResultDelivered(t *testing.T) {
+        	got, err := FirstResult(context.Background(), func() int { return 42 })
+        	if err != nil {
+        		t.Fatalf("FirstResult error = %v, want nil", err)
+        	}
+        	if got != 42 {
+        		t.Fatalf("FirstResult = %d, want 42", got)
+        	}
+        }
+
+        func TestExpiredContextReturnsError(t *testing.T) {
+        	ctx, cancel := context.WithCancel(context.Background())
+        	cancel() // deadline already blown before the probe starts
+        	gate := make(chan struct{})
+        	defer close(gate) // release the worker only after the assertion
+        	if _, err := FirstResult(ctx, func() int { <-gate; return 7 }); err == nil {
+        		t.Fatal("FirstResult error = nil with an expired context, want ctx.Err()")
+        	}
+        }
+
+        func TestCancelWhileWorkInFlight(t *testing.T) {
+        	ctx, cancel := context.WithCancel(context.Background())
+        	defer cancel()
+        	started := make(chan struct{})
+        	gate := make(chan struct{})
+        	defer close(gate) // release the worker only after the assertion
+        	done := make(chan error, 1)
+        	go func() {
+        		_, err := FirstResult(ctx, func() int { close(started); <-gate; return 7 })
+        		done <- err
+        	}()
+        	// The probe is provably in flight before the deadline fires -- this is a
+        	// mid-work timeout, not the pre-flight one the previous test covers.
+        	<-started
+        	cancel()
+        	select {
+        	case err := <-done:
+        		if err == nil {
+        			t.Fatal("FirstResult error = nil after cancel mid-work, want ctx.Err()")
+        		}
+        	case <-time.After(drainDeadline):
+        		t.Fatal("FirstResult still blocked 2s after cancel -- is the work running on the caller's path?")
+        	}
+        }
+
+        func TestAbandonedWorkersExit(t *testing.T) {
+        	baseline := runtime.NumGoroutine() // captured at test start, before any spawns
+        	ctx, cancel := context.WithCancel(context.Background())
+        	cancel()
+        	gate := make(chan struct{})
+        	for i := 0; i < leakCalls; i++ {
+        		if _, err := FirstResult(ctx, func() int { <-gate; return 7 }); err == nil {
+        			t.Fatal("FirstResult error = nil with an expired context, want ctx.Err()")
+        		}
+        	}
+        	// Every worker finishes its work only AFTER all callers have abandoned
+        	// it. A leak-free wrapper lets all of them exit; a blocked sender never
+        	// does.
+        	close(gate)
+        	deadline := time.Now().Add(drainDeadline)
+        	for time.Now().Before(deadline) {
+        		if runtime.NumGoroutine() <= baseline {
+        			return
+        		}
+        		time.Sleep(10 * time.Millisecond)
+        	}
+        	t.Fatalf("goroutines: baseline %d, now %d after %d abandoned calls -- workers never exited (blocked send?)",
+        		baseline, runtime.NumGoroutine(), leakCalls)
+        }
+      tests:
+        - { name: TestResultDelivered,           visible: true,  golden: "live ctx: FirstResult returns 42, nil" }
+        - { name: TestExpiredContextReturnsError, visible: true,  golden: "expired ctx with a slow worker: returns ctx.Err(), never the value" }
+        - { name: TestCancelWhileWorkInFlight,   visible: false, golden: "a cancel landing while work is in flight gets ctx.Err() without waiting for the work — the fix may not move work onto the caller's goroutine" }
+        - { name: TestAbandonedWorkersExit,      visible: false, golden: "after 10 probes abandoned on an expired ctx, goroutine count drains back to its start value within the poll window" }
+      race: true
+      timeout_ms: 15000
+
+  - id: go04e-a4
+    type: explain_tradeoff
+    covers: [go04e-o2]
+    difficulty: hard
+    prompt: |
+      In writing: state in one sentence why the unbuffered FirstResult leaks its worker. Then
+      defend the cap-1 result channel as the fix against BOTH rejected alternatives —
+      (a) "do nothing: the GC collects unreachable goroutines eventually", (b) a ctx-aware
+      select around the worker's send. Name each one's concrete failure or cost mode and
+      include at least one number.
+    grading:
+      strategy: llm_judge
+      judge_mode: rubric
+      rubric:
+        pass_threshold: 0.6
+        criteria:
+          - { id: c1, weight: 0.4, text: "Names both rejected alternatives and WHY each loses: a blocked goroutine is a GC root so collection never comes; ctx-select fixes the leak but taxes every worker with ctx plumbing and saves nothing for sub-100 ms work" }
+          - { id: c2, weight: 0.3, text: "States the concrete failure mode: worker parked in [chan send] forever, unbounded goroutine growth under churn" }
+          - { id: c3, weight: 0.3, text: "Includes a quantified claim (per-goroutine stack cost, leak growth rate, or the buffer's cost)" }
+        anti_reward_hacking: { min_words: 40, penalize_if_contains: ["as an AI", "it depends"] }
+    reference_answer: |
+      The worker parks forever in [chan send] because its only receiver returned on ctx
+      timeout, and no receiver can ever arrive again. (a) Waiting for the GC is rejected
+      because a blocked goroutine is a GC root — its stack, channel, and pending result stay
+      reachable, so collection never comes; at conclave's ~5 s peer churn that is ~720 leaked
+      probers/hour ≈ 34 MB/day in 2 KB stacks alone, with NumGoroutine climbing unbounded.
+      (b) A ctx-aware select on the send does fix the leak, but is rejected as the default
+      here: it forces ctx plumbing into every worker and still evaluates probe() before
+      parking, so it saves no work on a sub-100 ms probe — extra surface, no gain. The cap-1
+      buffer makes the send unblockable by construction for the price of one buffered slot
+      (8 bytes for an int): the worker always exits, and an abandoned result is collected
+      with its channel.
+
+limitations: >
+  The drain assertion proves the ten exercised workers exited on this box in this
+  interleaving — runtime.NumGoroutine() is a global count, not identity, so it cannot say
+  WHICH goroutine leaked (goleak attributes by stack, but it is a non-stdlib dep the offline
+  runner rejects). The cap-1 fix buys leak-freedom, not cancellation: an abandoned probe still
+  runs to completion and burns its CPU — stopping the work early is go04d's contract, not this
+  lesson's. And the loop-variable item proves 1.22+ semantics only under this module's go 1.26
+  pin; a module whose go.mod still says go 1.21 keeps the old shared-variable capture even on
+  the same toolchain.

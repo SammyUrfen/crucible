@@ -1,0 +1,248 @@
+# Pilot lesson 1 — authored per content/go/PILOT-CONVENTIONS.md; verify: make verify ID=go04a-channel-ownership
+schema_version: 1
+id: go04a-channel-ownership
+tag: go04a
+title: "Go: channel ownership — who closes, and what close actually does"
+track: go
+week: "Track Go · Module 04 (pilot) · Lesson 1"
+priority: attack
+content_rev: 1
+toolchain: { go: "1.26" }
+prerequisites: []
+altitude: on_ramp
+summary: >
+  close(ch) is not a destructor — it is a broadcast that no more values are coming. The skill
+  here is assigning WHO may call it: the sender that owns the channel, and only once. You have
+  built this discipline before (a producer signalling completion to consumers); Go just gives
+  the mistake sharper teeth: a wrong owner is a runtime panic, not a stale flag. This is the
+  exact shape of conclave's signaling fan-out — one event source, many subscriber readers.
+
+learning_objectives:
+  - { id: go04a-o1, bloom: analyze,  text: "Predict the runtime behavior of send/receive/close against open, closed, and drained channels (comma-ok, zero value, panic)" }
+  - { id: go04a-o2, bloom: evaluate, text: "Assign close responsibility in a multi-producer topology and defend it against the rejected alternatives" }
+  - { id: go04a-o3, bloom: create,   text: "Repair a producer/consumer pipeline whose receiver closes the channel, without changing its observable results" }
+
+teach:
+  - heading: "close is a broadcast, not a destructor"
+    covers: [go04a-o1]
+    body: |
+      Four rules decide every close question. Receive from a closed channel: succeeds
+      immediately with the zero value, and the comma-ok form reports `ok == false` once the
+      buffer is drained. `range ch` consumes until drained-and-closed, then exits. Send on a
+      closed channel: `panic: send on closed channel`. Closing twice, or closing a nil
+      channel: panic too.
+
+      > [!KEY] Closing is a SENDER-side completion signal. Receivers detect it (comma-ok, range exit); they never issue it.
+
+      Note what is absent: freeing memory. An unclosed channel is garbage-collected once
+      unreachable. You close to *signal*, never to "clean up" — a channel no goroutine will
+      range over again needs no close at all.
+  - heading: "who closes: the owner — and with N producers, a delegate"
+    covers: [go04a-o2, go04a-o3]
+    body: |
+      Ownership rule: the goroutine that is the sole remaining sender closes. With one
+      producer that is just "close before returning". With N producers nobody may close
+      directly — the first close panics every in-flight sender, and a second close panics
+      itself. The idiomatic delegate:
+
+      ```go
+      var wg sync.WaitGroup            // one closer goroutine owns the close
+      for _, p := range producers {
+          wg.Add(1)
+          go func() { defer wg.Done(); p.sendAll(ch) }()
+      }
+      go func() { wg.Wait(); close(ch) }()
+      ```
+
+      This is conclave's signaling fan-in: N peers push events, one place decides "no more
+      events". The consumer side stays a plain `for ev := range ch`.
+
+worked_examples:
+  - id: go04a-w1
+    covers: [go04a-o1]
+    prompt: |
+      A buffered channel (cap 2) holds values 7 and 9 and has been closed. Walk through what
+      three consecutive receives return, using the comma-ok form.
+    solution: |
+      Receive 1: 7, ok=true (buffer drains first — close does not discard buffered values).
+      Receive 2: 9, ok=true. Receive 3: 0, ok=false — zero value plus the closed signal, and
+      every further receive keeps returning 0,false immediately (it never blocks).
+
+assessments:
+  - id: go04a-a1
+    type: mcq
+    covers: [go04a-o2]
+    difficulty: easy
+    prompt: |
+      conclave-shaped scenario: 3 producer goroutines send events into one results channel;
+      1 consumer ranges over it and must learn when everything is done. Who closes the channel?
+    grading:
+      strategy: deterministic_choice
+      options:
+        - text: "The consumer, once it has received the count it expects"
+          correct: false
+          why: "The receiver cannot know sends have stopped; an in-flight send then hits panic: send on closed channel — and the panic is in the producer, far from the bug."
+        - text: "Each producer closes it as it finishes"
+          correct: false
+          why: "The second producer to finish panics with close of closed channel; N owners means N-1 double-closes."
+        - text: "A closer goroutine: wg.Wait() for all producers, then close"
+          correct: true
+          why: "Delegated single ownership — exactly one close, provably after the last send (WaitGroup happens-before), and the consumer's range exits cleanly."
+        - text: "Nobody — the GC reclaims the channel when producers exit"
+          correct: false
+          why: "GC only reclaims an UNREACHABLE channel; the consumer still ranges over it, so it blocks forever — a goroutine leak, not cleanup."
+    reference_answer: "A closer goroutine: wg.Wait() for all producers, then close"
+
+  - id: go04a-a2
+    type: predict_output
+    covers: [go04a-o1]
+    difficulty: easy
+    prompt: |
+      Predict the exact stdout of this program (one value per Println line).
+    grading:
+      strategy: deterministic_output
+      runner: "go run"
+      match: trimmed
+      program: |
+        package main
+
+        import "fmt"
+
+        func main() {
+        	ch := make(chan int, 2)
+        	ch <- 1
+        	ch <- 2
+        	close(ch)
+        	for v := range ch {
+        		fmt.Println(v)
+        	}
+        	v, ok := <-ch
+        	fmt.Println(v, ok)
+        }
+      expected_output: |
+        1
+        2
+        0 false
+
+  - id: go04a-a3
+    type: debug_this
+    covers: [go04a-o3]
+    difficulty: medium
+    prompt: |
+      This pipeline panics under test. Fix it so ALL produced values are delivered and the
+      channel still gets closed — by the right owner. Keep both function signatures.
+    grading:
+      strategy: hidden_tests
+      language: go
+      buggy: |
+        package crucible
+
+        // Produce sends 1..n on out. Consume returns the sum of everything produced.
+        // Something about who closes -- and who decides "done" -- is wrong here.
+
+        func Produce(out chan<- int, n int) {
+        	for i := 1; i <= n; i++ {
+        		out <- i
+        	}
+        }
+
+        func Consume(in chan int) int {
+        	sum := 0
+        	for i := 0; i < 3; i++ { // "we usually get about 3" -- a guess, not a signal
+        		sum += <-in
+        	}
+        	close(in) // receiver "cleaning up" a channel it does not own
+        	return sum
+        }
+      reference_solution: |
+        package crucible
+
+        // Produce owns out: it is the sole sender, so it closes after the last send.
+        func Produce(out chan<- int, n int) {
+        	for i := 1; i <= n; i++ {
+        		out <- i
+        	}
+        	close(out)
+        }
+
+        // Consume drains until the owner signals completion; it never closes.
+        func Consume(in chan int) int {
+        	sum := 0
+        	for v := range in {
+        		sum += v
+        	}
+        	return sum
+        }
+      test_code: |
+        package crucible
+
+        import (
+        	"testing"
+        	"time"
+        )
+
+        func TestSumAllDelivered(t *testing.T) {
+        	ch := make(chan int)
+        	go Produce(ch, 5)
+        	if got := Consume(ch); got != 15 {
+        		t.Fatalf("Consume = %d, want 15 (all 5 produced values)", got)
+        	}
+        }
+
+        func TestReceiveAfterCloseIsZeroFalse(t *testing.T) {
+        	ch := make(chan int)
+        	go Produce(ch, 3)
+        	if got := Consume(ch); got != 6 {
+        		t.Fatalf("Consume = %d, want 6", got)
+        	}
+        	select {
+        	case v, ok := <-ch:
+        		if ok || v != 0 {
+        			t.Fatalf("post-completion receive = %d,%v; want 0,false from the owner's close", v, ok)
+        		}
+        	case <-time.After(2 * time.Second):
+        		t.Fatal("receive blocked: the channel was never closed by its owner")
+        	}
+        }
+      tests:
+        - { name: TestSumAllDelivered,            visible: true,  golden: "Produce(5) then Consume == 15, no panic" }
+        - { name: TestReceiveAfterCloseIsZeroFalse, visible: false, golden: "after Consume returns, a bare receive yields 0,false immediately" }
+      race: true
+      timeout_ms: 10000
+
+  - id: go04a-a4
+    type: explain_tradeoff
+    covers: [go04a-o2]
+    difficulty: hard
+    prompt: |
+      In writing: state the ownership rule for close. Then, for the 3-producers/1-consumer
+      fan-in, defend the closer-goroutine pattern against BOTH rejected alternatives —
+      (a) the consumer closes, (b) the last producer closes, detected via an atomic counter.
+      Name each one's concrete failure mode and include at least one number.
+    grading:
+      strategy: llm_judge
+      judge_mode: rubric
+      rubric:
+        pass_threshold: 0.6
+        criteria:
+          - { id: c1, weight: 0.4, text: "Names both rejected alternatives and WHY each is wrong (receiver can't know sends stopped; counter-based last-producer close is fragile ordering)" }
+          - { id: c2, weight: 0.3, text: "States the concrete failure modes: panic: send on closed channel / close of closed channel, or the blocked-forever consumer leak" }
+          - { id: c3, weight: 0.3, text: "Includes a quantified claim (cost of the extra goroutine, per-send overhead, or leak growth)" }
+        anti_reward_hacking: { min_words: 40, penalize_if_contains: ["as an AI", "it depends"] }
+    reference_answer: |
+      Only the sole remaining sender may close — receivers detect completion, they never
+      declare it. (a) Consumer-closes fails because the receiver cannot know sends have
+      stopped: any in-flight send then dies with panic: send on closed channel, and the crash
+      surfaces in the producer, far from the faulty close. (b) Last-producer-closes via an
+      atomic counter works only if the decrement is provably after that producer's final send;
+      reorder one line during a refactor and two producers both see zero — close of closed
+      channel. The closer goroutine costs one goroutine (~2 KB stack) and a single wg.Wait,
+      adds zero per-send overhead, and gives exactly one close with a WaitGroup
+      happens-before edge guaranteeing it follows the last send.
+
+limitations: >
+  The debug_this panic is deterministic only because the unbuffered rendezvous leaves the
+  producer blocked mid-send when the consumer closes; with a buffered channel the same bug can
+  pass quietly for days — that fragility is the point, but a green run here does not prove your
+  larger pipelines close correctly. This lesson teaches ownership discipline, not the memory
+  model (that is go05c), and -race green remains a probabilistic absence of observed races (R4).

@@ -1,0 +1,390 @@
+# Pilot capstone — authored per content/go/PILOT-CONVENTIONS.md; verify: make verify ID=go05g-upload-meter
+schema_version: 1
+id: go05g-upload-meter
+tag: go05g
+title: "Go capstone: conclave's upload meter — lock-free counting under contention"
+track: go
+week: "Track Go · Module 04/05 (pilot) · Capstone"
+priority: attack
+content_rev: 1
+toolchain: { go: "1.26" }
+prerequisites: [go05e-rwmutex-scaling, go05f-sync-once]
+altitude: ramp
+summary: >
+  This is the real subsystem: conclave meters every peer's upload on the per-packet hot path,
+  and that meter's numbers (the ~6 Mbit/s mesh ceiling at 5 peers) are what justified the SFU.
+  You have shipped this shape before — GOOGLY's LongAdder counters with an atomic buffer swap
+  for exactly-once flush. Go spells it atomic.Int64: Add on the hot path, Swap(0) at harvest.
+  The capstone is the whole module's discipline in one artifact: a conservation contract, the
+  one bug that silently violates it (Load-then-Store), and a written defense of the design —
+  then the type ports into conclave unchanged.
+
+learning_objectives:
+  - { id: go05g-o1, bloom: create,   text: "Implement UploadMeter (AddBytes hot path, ReadAndReset harvest) so no byte is lost or double-counted under any concurrent interleaving, -race clean" }
+  - { id: go05g-o2, bloom: analyze,  text: "Pinpoint why Load()+Store(0) drops concurrent updates — the window between the two operations — and why Swap(0) closes it by construction" }
+  - { id: go05g-o3, bloom: evaluate, text: "Defend atomic Add+Swap against a Mutex-guarded counter and a channel-of-deltas aggregator with numbers, and name where the atomic design stops being valid" }
+
+teach:
+  - heading: "One word, one contract — and THE bug"
+    covers: [go05g-o1, go05g-o2]
+    body: |
+      The meter's contract is conservation: the sum of every ReadAndReset return, plus one
+      final read after all writers stop, equals the total of all AddBytes(n). The hot path
+      is the easy half — atomic.Int64.Add is one hardware read-modify-write (LOCK XADD on
+      amd64, ~5-10 ns uncontended), nothing for 8 senders to queue behind.
+
+      The harvest is where meters die. The tempting spelling:
+
+      ```go
+      v := m.bytes.Load() // reaper takes a snapshot...
+      m.bytes.Store(0)    // ...and wipes whatever landed since
+      return v
+      ```
+
+      Between Load and Store a concurrent AddBytes(1200) makes the counter v+1200; Store(0)
+      erases it. Every access is atomic, so -race stays SILENT — this is a lost update above
+      the memory model, not a data race. Against this lesson's contention test the buggy
+      spelling dropped 134,855 of 560,000 bytes in one run — ~24% of traffic, no warning.
+
+      > [!KEY] A harvest must be ONE indivisible RMW: Swap(0) returns the old value and installs 0 atomically. Load-then-Store is two operations, and the window between them eats bytes.
+  - heading: "The defense: Mutex, channel — and the boundary where atomic dies"
+    covers: [go05g-o3]
+    body: |
+      A Mutex-guarded int64 is correct — and taxes every packet with a lock/unlock pair
+      (~15-25 ns uncontended; under 8-way contention waiters convoy through the futex slow
+      path) to protect a single word that a lock-free Add updates in ~5-10 ns. A
+      channel-of-deltas aggregator is correct too — and charges each packet a send
+      (~100-300 ns with the scheduler hop, blocking outright when the drain goroutine falls
+      behind) plus one extra goroutine whose shutdown you now own (go04a: who closes?).
+      UploadMeter has no Stop method; a design that needs a lifecycle here leaks by default.
+
+      The boundary is go05d's: the moment a SECOND field must move in lockstep with bytes —
+      say packetCount, where a reader must never see one packet's bytes paired with another
+      packet's count — two independent atomics can interleave between the updates and tear
+      the pair. Multi-word invariant → Mutex. One word, one invariant → atomic; this meter
+      is exactly that.
+
+worked_examples:
+  - id: go05g-w1
+    covers: [go05g-o2]
+    prompt: |
+      The reaper runs the buggy Load-then-Store harvest while one peer sends a 1,200-byte
+      packet. The counter holds 96,400. Walk the interleaving that loses the packet, then
+      show why Swap(0) conserves it in BOTH orderings.
+    solution: |
+      Loss: reaper Loads 96,400 → hot path Adds 1,200 (counter now 97,600) → reaper Stores 0
+      and returns 96,400. Harvested 96,400 + counter 0, but 97,600 was added — 1,200 bytes
+      are gone. With Swap: either Swap runs first (returns 96,400, counter 0, the Add then
+      makes it 1,200 — the packet is simply harvested next tick) or the Add runs first (Swap
+      returns 97,600, counter 0). Both orderings satisfy harvested + remaining == added;
+      there is no third interleaving, because Swap has no inside.
+
+assessments:
+  - id: go05g-a1
+    type: predict_output
+    covers: [go05g-o2]
+    difficulty: medium
+    prompt: |
+      The window, frozen. This program runs the buggy Load-then-Store harvest, but channels
+      pin the interleaving so the loss happens on demand instead of once a week in
+      production. Predict the exact stdout (four Println lines).
+    grading:
+      strategy: deterministic_output
+      runner: "go run"
+      match: trimmed
+      program: |
+        package main
+
+        import (
+        	"fmt"
+        	"sync/atomic"
+        )
+
+        // conclave's stats ticker running a BROKEN ReadAndReset: Load, then Store(0).
+        // Channels freeze the exact interleaving so the window is visible on demand.
+        func main() {
+        	var bytes atomic.Int64
+        	bytes.Add(100) // packets sent before this tick
+
+        	loaded := make(chan int64)   // ticker has Loaded; Store not yet issued
+        	added := make(chan struct{}) // hot path landed inside the window
+        	done := make(chan struct{})
+
+        	go func() { // the two halves of the buggy ReadAndReset
+        		v := bytes.Load()
+        		loaded <- v
+        		<-added
+        		bytes.Store(0)
+        		close(done)
+        	}()
+
+        	harvested := <-loaded
+        	bytes.Add(7) // hot path: one packet, inside the window
+        	close(added)
+        	<-done
+
+        	left := bytes.Load()
+        	fmt.Println("harvested:", harvested)
+        	fmt.Println("left in meter:", left)
+        	fmt.Println("added in total:", 107)
+        	fmt.Println("lost:", 107-harvested-left)
+        }
+      expected_output: |
+        harvested: 100
+        left in meter: 0
+        added in total: 107
+        lost: 7
+
+  - id: go05g-a2
+    type: mcq
+    covers: [go05g-o2]
+    difficulty: medium
+    prompt: |
+      conclave field report: the upload meter comes up a few KB short of ffprobe's ground
+      truth under load — the session total stays short permanently, later ticks never make
+      it up — and -race is silent. The meter:
+
+      ```go
+      type UploadMeter struct{ bytes atomic.Int64 }
+
+      func (m *UploadMeter) AddBytes(n int64) { m.bytes.Add(n) } // hot path
+
+      func (m *UploadMeter) ReadAndReset() int64 {
+      	v := m.bytes.Load()  // L1
+      	m.bytes.Store(0)     // L2
+      	return v
+      }
+      ```
+
+      Where do the bytes go?
+    grading:
+      strategy: deterministic_choice
+      options:
+        - text: "Adds that land between L1 and L2 are erased — Load-then-Store is two operations, and Store(0) overwrites whatever arrived in the window"
+          correct: true
+          why: "L1 harvests v; a concurrent AddBytes makes the counter v+n; L2 installs 0 and n is gone. Both accesses are atomic, so -race has nothing to report — a lost update lives above the memory model. Swap(0) harvests and zeroes in one indivisible RMW, so the window ceases to exist."
+        - text: "atomic.Int64.Add is not atomic enough across 8 goroutines — concurrent increments collide unless AddBytes takes a mutex"
+          correct: false
+          why: "Add compiles to a single hardware read-modify-write (LOCK XADD on amd64); concurrent Adds never lose increments — if they could, no lock-free counter could exist. The hot path is innocent; the loss is in the reader."
+        - text: "ReadAndReset lacks a mutex, so the reader has no visibility into the writers' updates and reads stale values"
+          correct: false
+          why: "Atomics are synchronization operations in the Go memory model — a Load observes fully published values with no mutex needed for one word. Staleness also cannot explain the arithmetic: a stale read delays bytes to the next tick; here the sum stays permanently short."
+        - text: "GC pauses interrupt AddBytes mid-update, and the increment is dropped when the goroutine resumes"
+          correct: false
+          why: "The GC never mutates your values and cannot roll back an atomic op — a pause delays a goroutine, which then resumes exactly where it was. Blaming the runtime is how a lost-update bug survives code review."
+    reference_answer: "Adds that land between L1 and L2 are erased — Load-then-Store is two operations, and Store(0) overwrites whatever arrived in the window"
+
+  - id: go05g-a3
+    type: code_from_scratch
+    covers: [go05g-o1]
+    difficulty: hard
+    prompt: |
+      Build the real thing — this type ports into conclave unchanged. Implement UploadMeter:
+      AddBytes(n int64) on the per-packet hot path, ReadAndReset() int64 on the stats
+      ticker. The doc contract in the starter is binding: no byte lost, none counted twice,
+      under any interleaving. The visible test checks single-goroutine behavior; hidden
+      tests attack the harvest under real contention and audit hygiene.
+    grading:
+      strategy: hidden_tests
+      language: go
+      starter: |
+        package crucible
+
+        // UploadMeter counts bytes sent on conclave's per-packet hot path.
+        //
+        // Contract -- must hold under ANY interleaving: the sum of every value
+        // ReadAndReset has returned, plus one final ReadAndReset after all writers
+        // stop, equals the total of all n passed to AddBytes. No byte lost, none
+        // counted twice.
+        //
+        // AddBytes is called from many goroutines, once per packet. ReadAndReset
+        // is called by one stats ticker. UploadMeter has no Stop or Close -- a
+        // correct implementation does not need a lifecycle.
+        type UploadMeter struct {
+        	// TODO: pick the representation. One field is enough.
+        }
+
+        // AddBytes records n more bytes sent. This is the hot path.
+        func (m *UploadMeter) AddBytes(n int64) {
+        	// TODO
+        }
+
+        // ReadAndReset returns every byte recorded since the previous call and
+        // zeroes the meter, losing nothing in between.
+        func (m *UploadMeter) ReadAndReset() int64 {
+        	// TODO
+        	return 0
+        }
+      reference_solution: |
+        package crucible
+
+        import "sync/atomic"
+
+        // UploadMeter counts bytes sent on conclave's per-packet hot path.
+        // One atomic word: Add on the hot path, Swap(0) at harvest time.
+        type UploadMeter struct {
+        	bytes atomic.Int64
+        }
+
+        // AddBytes records n more bytes sent. One lock-free hardware RMW --
+        // nothing for concurrent senders to queue behind.
+        func (m *UploadMeter) AddBytes(n int64) {
+        	m.bytes.Add(n)
+        }
+
+        // ReadAndReset harvests and zeroes in ONE indivisible operation. Swap(0)
+        // returns the old value and installs 0 atomically; a Load-then-Store pair
+        // would open a window where a concurrent AddBytes lands and is erased.
+        func (m *UploadMeter) ReadAndReset() int64 {
+        	return m.bytes.Swap(0)
+        }
+      test_code: |
+        package crucible
+
+        import (
+        	"runtime"
+        	"sync"
+        	"testing"
+        	"time"
+        )
+
+        func TestSequential(t *testing.T) {
+        	var m UploadMeter
+        	m.AddBytes(10)
+        	m.AddBytes(32)
+        	if got := m.ReadAndReset(); got != 42 {
+        		t.Fatalf("ReadAndReset = %d, want 42", got)
+        	}
+        	if got := m.ReadAndReset(); got != 0 {
+        		t.Fatalf("second ReadAndReset = %d, want 0 (the meter must reset)", got)
+        	}
+        }
+
+        func TestNothingLostUnderContention(t *testing.T) {
+        	const (
+        		adders   = 8
+        		addsEach = 10000
+        		chunk    = 7
+        		want     = int64(adders * addsEach * chunk)
+        	)
+        	var m UploadMeter
+        	start := make(chan struct{})
+        	stop := make(chan struct{})
+        	reaped := make(chan int64, 1)
+        	go func() { // reaper: harvests concurrently with the adders
+        		var sum int64
+        		for {
+        			select {
+        			case <-stop:
+        				reaped <- sum
+        				return
+        			default:
+        				sum += m.ReadAndReset()
+        			}
+        		}
+        	}()
+        	var wg sync.WaitGroup
+        	for i := 0; i < adders; i++ {
+        		wg.Add(1)
+        		go func() {
+        			defer wg.Done()
+        			<-start // barrier: all adders contend at once
+        			for j := 0; j < addsEach; j++ {
+        				m.AddBytes(chunk)
+        			}
+        		}()
+        	}
+        	close(start)
+        	wg.Wait()   // all adds are in
+        	close(stop) // now stop the reaper deterministically
+        	total := <-reaped + m.ReadAndReset()
+        	if total != want {
+        		t.Fatalf("reaper sums + final read = %d, want %d (lost %d bytes)", total, want, want-total)
+        	}
+        }
+
+        func TestNoGoroutineLeak(t *testing.T) {
+        	baseline := runtime.NumGoroutine()
+        	func() {
+        		var m UploadMeter
+        		var wg sync.WaitGroup
+        		for i := 0; i < 4; i++ {
+        			wg.Add(1)
+        			go func() {
+        				defer wg.Done()
+        				for j := 0; j < 1000; j++ {
+        					m.AddBytes(1)
+        				}
+        			}()
+        		}
+        		wg.Wait()
+        		if got := m.ReadAndReset(); got != 4000 {
+        			t.Fatalf("ReadAndReset = %d, want 4000", got)
+        		}
+        	}()
+        	deadline := time.Now().Add(2 * time.Second)
+        	for runtime.NumGoroutine() > baseline {
+        		if time.Now().After(deadline) {
+        			t.Fatalf("goroutines: %d > baseline %d after 2s -- the meter must not spawn helpers it cannot stop",
+        				runtime.NumGoroutine(), baseline)
+        		}
+        		time.Sleep(10 * time.Millisecond)
+        	}
+        }
+      tests:
+        - { name: TestSequential,                visible: true,  golden: "10+32 added; first ReadAndReset is 42, second is 0" }
+        - { name: TestNothingLostUnderContention, visible: false, golden: "8 adders x 10k adds of 7 B against a live reaper: reaper sums + final read == 560000" }
+        - { name: TestNoGoroutineLeak,           visible: false, golden: "goroutine count returns to baseline; the meter spawned nothing it cannot stop" }
+      race: true
+      timeout_ms: 15000
+
+  - id: go05g-a4
+    type: explain_tradeoff
+    covers: [go05g-o3]
+    difficulty: hard
+    prompt: |
+      In writing: defend the shipped design — atomic.Int64 with Add on the hot path and
+      Swap(0) in ReadAndReset — against BOTH rejected alternatives: (a) a Mutex-guarded
+      int64 counter, (b) a channel-of-deltas feeding an aggregator goroutine. Name each
+      one's concrete cost or failure mode on conclave's per-packet hot path and include at
+      least one number. Then close with the boundary: what change to UploadMeter's
+      requirements would make the atomic design WRONG (go05d told you), and what do you
+      reach for then?
+    grading:
+      strategy: llm_judge
+      judge_mode: rubric
+      rubric:
+        pass_threshold: 0.6
+        criteria:
+          - { id: c1, weight: 0.35, text: "Names both rejected alternatives AND the winning property: Add is a lock-free hot path; Swap(0) is an indivisible harvest, so no lost-update window exists" }
+          - { id: c2, weight: 0.35, text: "Concrete cost/failure mode for each rejection: per-packet lock/unlock overhead and contention convoy for the Mutex; per-send scheduling cost, blocking backpressure, and an aggregator shutdown lifecycle (leak-by-default) for the channel" }
+          - { id: c3, weight: 0.3, text: "At least one quantified claim (ns/op, packets/s, goroutine cost) AND the go05d boundary: a second lockstep field makes independent atomics tear the pair — promote to a Mutex" }
+        anti_reward_hacking: { min_words: 40, penalize_if_contains: ["as an AI", "it depends"] }
+    reference_answer: |
+      Atomic wins because both operations are single indivisible RMWs: AddBytes is one
+      lock-free hardware add (~5-10 ns uncontended, nothing to convoy behind), and Swap(0)
+      harvests-and-zeroes with no window, so the conservation contract holds with zero
+      coordination. (a) A Mutex-guarded counter is correct but taxes every packet with a
+      lock/unlock pair (~15-25 ns uncontended, worse under 8-way contention where waiters
+      convoy through the futex slow path) to protect a single word — at a few thousand
+      packets per second per peer that is pure hot-path overhead buying nothing atomic does
+      not already give. (b) A channel-of-deltas moves each count through a send (~100-300 ns
+      with the scheduler hop, and it blocks outright when the drain goroutine falls behind)
+      and adds a dedicated aggregator goroutine with a shutdown lifecycle the API does not
+      have — UploadMeter has no Stop, so that goroutine leaks by default and the hygiene
+      test finds it. The boundary is go05d's: the moment a second field (say packetCount)
+      must update in lockstep with bytes, two independent atomics can interleave between the
+      updates and a reader sees one packet's bytes with another's count — that is a
+      multi-word invariant, so promote the pair to a Mutex.
+
+limitations: >
+  The contention test is a falsifier, not a proof: it exercises only the schedules this box
+  produces (the buggy Load+Store failed it 10/10 authoring runs, dropping ~24% of bytes in
+  one, but an unlucky schedule passing a subtly wrong build remains possible), and -race
+  green stays a probabilistic absence of observed races (R4) — worse, this lesson's central
+  bug is invisible to -race in principle, since every access is atomic; only the
+  conservation arithmetic discriminates. The ns figures in the defense (~15-25 ns
+  lock/unlock, ~100-300 ns channel send) are order-of-magnitude microbenchmark lore, not
+  measured by this harness — a green run proves the contract, not throughput. And nothing
+  here licenses atomics beyond one word: the moment a second field must move in lockstep,
+  this design is wrong (go05d).

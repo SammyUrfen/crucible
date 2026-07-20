@@ -1,0 +1,73 @@
+/* ============================================================
+   Dracula Terminal — design tokens
+   The classic Dracula palette (#282a36 / #bd93f9 / #50fa7b),
+   everything monospace, scanlines optional. Light mode is the
+   "Alucard" paper variant. Usage: paste into any stylesheet;
+   set data-mode="dark" on <html> to flip modes.
+   ============================================================ */
+:root{
+  color-scheme:light;
+  /* surfaces — Alucard paper */
+  --bg:#f8f8f2;
+  --bg-subtle:#efefe9;
+  --surface:#ffffff;
+  --surface-2:#ebebe4;
+  --border:#d9d9d2;
+  --border-strong:#b0b0a8;
+  /* text */
+  --text:#282a36;
+  --text-2:#44475a;
+  --text-3:#6272a4;
+  /* accent — daylight purple */
+  --accent:#644ac9;
+  --accent-2:#52389f;
+  --on-accent:#f8f8f2;
+  --accent-soft:#e6def7;
+  /* status */
+  --ok:#2e7d32;       --ok-soft:#dff0df;
+  --warn:#a95f00;     --warn-soft:#f8ead2;
+  --bad:#cb3a2f;      --bad-soft:#f9dedb;
+  --bad-contrast:#fff8f6;
+  --info:#036a96;     --info-soft:#daedf7;
+  /* code block keeps the dark terminal even in light mode */
+  --code-bg:#efefe9;
+  /* shape — tight, terminal-ish */
+  --radius-s:4px;
+  --radius-m:6px;
+  --radius-l:10px;
+  --bw:1px;
+  /* depth — flat; terminals don't cast shadows */
+  --shadow-1:none;
+  --shadow-2:0 12px 40px rgb(20 20 40 / .35);
+  /* type — monospace all the way down */
+  --font-display:"Fira Code", "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+  --font-body:"Fira Code", "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+  --font-mono:"Fira Code", "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+  /* motion */
+  --ease:cubic-bezier(.2,.7,.3,1);
+}
+[data-mode="dark"]{
+  color-scheme:dark;
+  /* canonical Dracula */
+  --bg:#282a36;
+  --bg-subtle:#21222c;
+  --surface:#313341;
+  --surface-2:#3a3d4d;
+  --border:#44475a;
+  --border-strong:#6272a4;
+  --text:#f8f8f2;
+  --text-2:#ccd0e4;
+  --text-3:#8b93bd;
+  --accent:#bd93f9;
+  --accent-2:#cfa9fb;
+  --on-accent:#21222c;
+  --accent-soft:#3b3153;
+  --ok:#50fa7b;       --ok-soft:#1e3a28;
+  --warn:#ffb86c;     --warn-soft:#423019;
+  --bad:#ff5555;      --bad-soft:#452020;
+  --bad-contrast:#21222c;
+  --info:#8be9fd;     --info-soft:#173d46;
+  --code-bg:#21222c;
+  --shadow-1:none;
+  --shadow-2:0 12px 40px rgb(0 0 0 / .6);
+}

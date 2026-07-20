@@ -1,0 +1,446 @@
+# Pilot lesson — authored per content/go/PILOT-CONVENTIONS.md; verify: make verify ID=go05d-atomic-limits
+schema_version: 1
+id: go05d-atomic-limits
+tag: go05d
+title: "Go: atomic's limit — two atomics do not make one invariant"
+track: go
+week: "Track Go · Module 05 (pilot) · Lesson 11"
+priority: attack
+content_rev: 1
+toolchain: { go: "1.26" }
+prerequisites: [go05c-happens-before]
+altitude: ramp
+summary: >
+  You built this pattern's happy case in GOOGLY: LongAdder-style lock-free counters work
+  because each is ONE word with no promise to its neighbors. The moment a second field must
+  agree with the first — count and sum, bytes and packets — per-field atomics keep every
+  OPERATION indivisible while the INVARIANT between them tears: a reader sees one field
+  updated and the other not, -race stays silent, and nothing ever panics. This lesson makes
+  you watch the tear happen (it tripped on 15 of 15 measured runs), fix it with one Mutex
+  without touching the API, and say precisely when bare atomics remain the right call.
+
+learning_objectives:
+  - { id: go05d-o1, bloom: analyze,  text: "Locate the torn window two per-field atomics leave between their operations, and the inconsistent (yet -race-clean) read it permits" }
+  - { id: go05d-o2, bloom: create,   text: "Restore a two-field invariant with one Mutex around the pair, without changing the type's API" }
+  - { id: go05d-o3, bloom: evaluate, text: "Judge when atomics are sufficient (no cross-word invariant) versus when they lie, and defend the Mutex against the pointer-swap alternative with numbers" }
+
+teach:
+  - heading: "each operation is indivisible; the pair is not"
+    covers: [go05d-o1]
+    body: |
+      atomic.Int64.Add is one indivisible read-modify-write on one word, and (go05c) each
+      operation carries a happens-before edge to the Load that observes it. That contract
+      ends at the word boundary. This:
+
+      ```go
+      func (s *Stats) AddSample(v int64) {
+      	s.count.Add(1) // indivisible
+      	s.sum.Add(v)   // indivisible
+      }
+      ```
+
+      is two indivisible steps with a preemption point between them. A reader that Loads
+      both fields inside that gap sees count already bumped and sum not yet — a torn
+      LOGICAL pair. Measured on this box: 4 writers × 5000 AddSample(100) against a
+      snapshotting checker produced a violating pair — e.g. (count, sum) = (10, 900) —
+      on 15 of 15 runs, within the first dozen writes.
+
+      > [!KEY] Atomics compose per word, never per invariant. Two "thread-safe" fields do not make one thread-safe relationship.
+
+      And no tool will save you: -race hunts for unsynchronized access pairs, and here
+      every access is an atomic op — there is nothing for it to report, and its silence
+      says nothing about whether the words moved together. A torn pair draws zero race
+      reports, zero panics — just a wrong number downstream.
+
+  - heading: "one lock around the relationship — and when atomics are enough"
+    covers: [go05d-o2, go05d-o3]
+    body: |
+      The fix is boring on purpose: ONE sync.Mutex, both fields under it, and Snapshot
+      reading under the same lock that writes them.
+
+      ```go
+      type Stats struct {
+      	mu    sync.Mutex
+      	count int64 // both guarded by mu: the PAIR is the unit of consistency
+      	sum   int64
+      }
+      ```
+
+      The API does not change — callers cannot tell, except a torn read is now impossible
+      by construction. Cost: ~24 ns per uncontended AddSample, measured on this box
+      (i7-13650HX) — noise next to the network send each sample represents in conclave.
+
+      Two real alternatives, judged:
+      - atomic.Pointer[Pair] publishing a fresh immutable {count, sum} (go05a's
+        snapshot-swap shape): also correct — IF each update is a CAS retry loop
+        (Load, build the incremented pair, CompareAndSwap; a blind Load-then-Store
+        between two writers loses updates). Readers become wait-free, but every
+        update allocates a fresh 16-byte pair, so it fits read-mostly state (config,
+        routing tables), not a write-hot meter.
+      - Bare atomics remain right ONLY while no cross-word invariant exists: one counter,
+        one flag, one generation number. conclave's bytes-only upload meter was correct
+        as a single atomic.Int64; it stopped being correct the day a packet count joined
+        the byte count.
+
+      > [!KEY] Choosing the primitive is naming the unit of consistency: one word → atomic; a relationship → one Mutex, or one pointer to one immutable value.
+
+worked_examples:
+  - id: go05d-w1
+    covers: [go05d-o1]
+    prompt: |
+      conclave's upload meter was one atomic.Int64 of bytes. Phase 2 adds packet counting:
+      the sender loop now does bytes.Add(1200) then packets.Add(1), and Rate() reads
+      b, p := bytes.Load(), packets.Load(). Walk the interleaving that makes Rate()
+      report an average packet size larger than any packet ever sent.
+    solution: |
+      Sender finishes bytes.Add(1200) — bytes now includes the new packet. The scheduler
+      runs the reader before packets.Add(1): Rate() loads bytes WITH the packet counted
+      and packets WITHOUT it. After 3 real 1200 B packets, the torn read is (4800, 3) →
+      "average packet" 1600 B, 33% above anything on the wire. Every Load was perfectly
+      synchronized; the pair was never protected. And reordering cannot close the window,
+      only change which tears are visible: with packets.Add first this overshoot becomes
+      impossible, but the reader's own back-to-back Loads are a second unprotected gap —
+      a complete update landing between them still reads (3600, 4) → 900 B, an undershoot
+      possible under either write order. Only making the pair one unit closes both windows.
+
+assessments:
+  - id: go05d-a1
+    type: mcq
+    covers: [go05d-o1]
+    difficulty: easy
+    prompt: |
+      AddSample does count.Add(1) then sum.Add(v), both fields atomic.Int64; a concurrent
+      Snapshot Loads both. Exactly one claim below is true — which?
+    grading:
+      strategy: deterministic_choice
+      options:
+        - text: "atomic.Int64 makes each individual operation indivisible; it says nothing about a relationship BETWEEN two variables"
+          correct: true
+          why: "That is the entire contract: per-word indivisibility plus a happens-before edge per operation. Between the two Add calls the scheduler is free to run your reader — the pair was never promised."
+        - text: "The compiler will not reorder two atomic operations, so the two Adds execute as one indivisible unit"
+          correct: false
+          why: "Program order within the writer IS preserved for atomics — and it does not help: keeping the steps in order never fuses them into one, so the reader can still run in the gap between them."
+        - text: "If every field of a struct is an atomic type, a reader that Loads each field in turn observes a consistent struct"
+          correct: false
+          why: "Each Load is individually fresh, but between your first and second Load a writer can complete an entire update — field-by-field reads of 'thread-safe' fields still assemble a struct state that never existed."
+        - text: "go test -race will flag the torn Snapshot as a DATA RACE, because the invariant between count and sum is violated"
+          correct: false
+          why: "-race reports unsynchronized access pairs; every access here is synchronized. A broken invariant over correctly-synchronized words is invisible to the detector — an invariant TEST catches it, -race cannot."
+    reference_answer: "atomic.Int64 makes each individual operation indivisible; it says nothing about a relationship BETWEEN two variables"
+
+  - id: go05d-a2
+    type: predict_race_verdict
+    covers: [go05d-o1, go05d-o3]
+    difficulty: medium
+    prompt: |
+      Every shared access below is an atomic.Int64 operation, or synchronized by channels
+      and the WaitGroup. The checker regularly observes bytes != packets*1200 — on this box, at least once in 48
+      of 50 runs, up to ~300 torn observations in a single run. The binary is built with
+      -race and executed 50 times. Verdict?
+    grading:
+      strategy: deterministic_output
+      runner: "go build -race"
+      iterations: 50
+      expected_verdict: clean
+      confidence: probabilistic
+      program: |
+        package main
+
+        import (
+        	"fmt"
+        	"sync"
+        	"sync/atomic"
+        )
+
+        // conclave's upload meter after the second field landed: packets AND bytes,
+        // each its own atomic.Int64. Every fake packet is exactly 1200 bytes, so a
+        // consistent pair always satisfies bytes == packets*1200. The checker counts
+        // observations where it does not.
+        func main() {
+        	var packets, bytes atomic.Int64
+        	start := make(chan struct{})
+        	stop := make(chan struct{})
+        	var wg sync.WaitGroup
+        	for w := 0; w < 4; w++ {
+        		wg.Add(1)
+        		go func() {
+        			defer wg.Done()
+        			<-start
+        			for i := 0; i < 100; i++ {
+        				packets.Add(1)
+        				bytes.Add(1200)
+        			}
+        		}()
+        	}
+        	tornOut := make(chan int)
+        	go func() {
+        		<-start
+        		torn := 0
+        		for {
+        			select {
+        			case <-stop:
+        				tornOut <- torn
+        				return
+        			default:
+        			}
+        			if p, b := packets.Load(), bytes.Load(); b != p*1200 {
+        				torn++ // logically torn pair observed; count varies run to run
+        			}
+        		}
+        	}()
+        	close(start)
+        	wg.Wait()
+        	close(stop)
+        	torn := <-tornOut
+        	fmt.Println("final:", packets.Load(), bytes.Load())
+        	fmt.Println("ever saw a torn pair:", torn > 0)
+        }
+
+  - id: go05d-a3
+    type: debug_this
+    covers: [go05d-o2]
+    difficulty: medium
+    prompt: |
+      This Stats aggregator is "lock-free": both fields are atomic.Int64, every access is
+      a synchronized op, and -race is silent. The invariant test still fails: a checker
+      snapshotting (count, sum) while 4 writers each add 5000 samples of value 100
+      catches sum != count*100 — on 15 of 15 measured runs, e.g. (count, sum) = (10, 900)
+      ten writes in. Restore the invariant WITHOUT changing the API — same signatures:
+      AddSample(int64), Snapshot() (count, sum int64), Mean() float64. Note the
+      final-totals test already passes: atomics never lost an update; that is not the bug.
+    grading:
+      strategy: hidden_tests
+      language: go
+      buggy: |
+        package crucible
+
+        import "sync/atomic"
+
+        // Stats aggregates samples for a rate estimator: how many samples arrived,
+        // and their sum. Callers rely on one invariant: any observed (count, sum)
+        // pair is consistent — with a constant sample value v, sum == count*v at
+        // every instant, not just at the end.
+        //
+        // Each field is "thread-safe" on its own. The invariant test still fails.
+        type Stats struct {
+        	count atomic.Int64
+        	sum   atomic.Int64
+        }
+
+        // AddSample records one sample of value v.
+        func (s *Stats) AddSample(v int64) {
+        	s.count.Add(1)
+        	s.sum.Add(v)
+        }
+
+        // Snapshot returns the pair (count, sum) as one consistent observation.
+        func (s *Stats) Snapshot() (count, sum int64) {
+        	return s.count.Load(), s.sum.Load()
+        }
+
+        // Mean returns sum/count, or 0 before any sample.
+        func (s *Stats) Mean() float64 {
+        	count, sum := s.Snapshot()
+        	if count == 0 {
+        		return 0
+        	}
+        	return float64(sum) / float64(count)
+        }
+      reference_solution: |
+        package crucible
+
+        import "sync"
+
+        // Stats aggregates samples behind ONE mutex. (count, sum) is a multi-word
+        // invariant, so both words live in a single critical section: per-field
+        // atomics made each word indivisible but left the relationship between the
+        // words unprotected — the lock protects the relationship itself.
+        type Stats struct {
+        	mu    sync.Mutex
+        	count int64
+        	sum   int64
+        }
+
+        // AddSample records one sample of value v — both fields move together.
+        func (s *Stats) AddSample(v int64) {
+        	s.mu.Lock()
+        	s.count++
+        	s.sum += v
+        	s.mu.Unlock()
+        }
+
+        // Snapshot returns (count, sum) read under the same lock that writes them:
+        // a torn pair is impossible by construction, not by luck.
+        func (s *Stats) Snapshot() (count, sum int64) {
+        	s.mu.Lock()
+        	defer s.mu.Unlock()
+        	return s.count, s.sum
+        }
+
+        // Mean returns sum/count, or 0 before any sample.
+        func (s *Stats) Mean() float64 {
+        	count, sum := s.Snapshot()
+        	if count == 0 {
+        		return 0
+        	}
+        	return float64(sum) / float64(count)
+        }
+      test_code: |
+        package crucible
+
+        import (
+        	"sync"
+        	"testing"
+        )
+
+        const (
+        	writers     = 4
+        	perWriter   = 5000
+        	sampleValue = 100
+        )
+
+        func TestSnapshotInvariantUnderConcurrentWrites(t *testing.T) {
+        	var s Stats
+        	start := make(chan struct{})
+        	writersDone := make(chan struct{})
+        	var wg sync.WaitGroup
+        	for w := 0; w < writers; w++ {
+        		wg.Add(1)
+        		go func() {
+        			defer wg.Done()
+        			<-start
+        			for i := 0; i < perWriter; i++ {
+        				s.AddSample(sampleValue)
+        			}
+        		}()
+        	}
+        	type pair struct{ count, sum int64 }
+        	violation := make(chan pair, 1)
+        	checkerDone := make(chan int)
+        	go func() {
+        		checks := 0
+        		defer func() { checkerDone <- checks }()
+        		for {
+        			select {
+        			case <-writersDone:
+        				return
+        			default:
+        			}
+        			checks++
+        			c, sum := s.Snapshot()
+        			if sum != c*sampleValue {
+        				select {
+        				case violation <- pair{c, sum}:
+        				default:
+        				}
+        				return
+        			}
+        		}
+        	}()
+        	close(start)
+        	wg.Wait()
+        	close(writersDone)
+        	checks := <-checkerDone
+        	select {
+        	case v := <-violation:
+        		t.Fatalf("torn snapshot after %d checks: (count, sum) = (%d, %d), want sum = count*%d = %d",
+        			checks, v.count, v.sum, sampleValue, v.count*sampleValue)
+        	default:
+        	}
+        }
+
+        func TestFinalTotalsAndMean(t *testing.T) {
+        	var s Stats
+        	start := make(chan struct{})
+        	var wg sync.WaitGroup
+        	for w := 0; w < writers; w++ {
+        		wg.Add(1)
+        		go func() {
+        			defer wg.Done()
+        			<-start
+        			for i := 0; i < perWriter; i++ {
+        				s.AddSample(sampleValue)
+        			}
+        		}()
+        	}
+        	close(start)
+        	wg.Wait()
+        	count, sum := s.Snapshot()
+        	if count != writers*perWriter || sum != writers*perWriter*sampleValue {
+        		t.Fatalf("final Snapshot = (%d, %d), want (%d, %d)",
+        			count, sum, writers*perWriter, writers*perWriter*sampleValue)
+        	}
+        	if m := s.Mean(); m != sampleValue {
+        		t.Fatalf("Mean = %v, want %v", m, float64(sampleValue))
+        	}
+        }
+
+        func TestZeroAndSequential(t *testing.T) {
+        	var s Stats
+        	if m := s.Mean(); m != 0 {
+        		t.Fatalf("Mean with zero samples = %v, want 0 (not NaN)", m)
+        	}
+        	for i := 0; i < 3; i++ {
+        		s.AddSample(10)
+        	}
+        	count, sum := s.Snapshot()
+        	if count != 3 || sum != 30 {
+        		t.Fatalf("Snapshot = (%d, %d), want (3, 30)", count, sum)
+        	}
+        	if m := s.Mean(); m != 10 {
+        		t.Fatalf("Mean = %v, want 10", m)
+        	}
+        }
+      tests:
+        - { name: TestSnapshotInvariantUnderConcurrentWrites, visible: true,  golden: "no snapshot ever violates sum == count*100 while 4 writers race the checker" }
+        - { name: TestFinalTotalsAndMean,                     visible: true,  golden: "final (count, sum) == (20000, 2000000) and Mean == 100 exactly — no lost updates" }
+        - { name: TestZeroAndSequential,                      visible: false, golden: "Mean is 0 (not NaN) before any sample; Snapshot (3, 30) and Mean 10 after three sequential AddSample(10)" }
+      race: true
+      timeout_ms: 15000
+
+  - id: go05d-a4
+    type: explain_tradeoff
+    covers: [go05d-o3]
+    difficulty: hard
+    prompt: |
+      conclave's upload meter now carries (bytes, packets), and the rate estimator must
+      read them as one consistent pair. In writing: defend the Mutex-guarded pair against
+      BOTH alternatives — (a) keeping two per-field atomic.Int64s, (b) atomic.Pointer[Meter]
+      swapping in a fresh immutable {bytes, packets} on every update (go05a's
+      snapshot-swap shape). For (a) name the concrete failure mode and why no tool flags
+      it; for (b) name the cost that makes it the wrong default on a write-hot path, and
+      the read/write mix where it wins. Include at least one number.
+    grading:
+      strategy: llm_judge
+      judge_mode: rubric
+      rubric:
+        pass_threshold: 0.6
+        criteria:
+          - { id: c1, weight: 0.4, text: "Rejects (a) with the mechanism: each op is indivisible but the pair is unprotected — a reader Loads in the gap between a writer's two Adds and gets a torn (bytes, packets)" }
+          - { id: c2, weight: 0.3, text: "States the concrete failure mode — a silently wrong derived number (rate/mean) with zero panics and zero -race reports — AND names the read/write mix where the pointer-swap (b) is the right call" }
+          - { id: c3, weight: 0.3, text: "Includes a quantified claim (uncontended Mutex ns/op, per-update allocation bytes, torn-pairs-per-run, or an updates/s rate)" }
+        anti_reward_hacking: { min_words: 40, penalize_if_contains: ["as an AI", "it depends"] }
+    reference_answer: |
+      Two per-field atomics are rejected because each Add is indivisible but the pair is
+      not: a reader that Loads packets after a writer's packets.Add(1) and bytes before
+      the matching bytes.Add(1200) publishes a torn meter. Nothing panics and -race stays
+      silent — every access is synchronized, so the detector has nothing to report; in
+      the 4-writer harness the checker caught a torn pair in 48 of 50 runs, up to ~300
+      times in one run. The Mutex-guarded pair makes a torn Snapshot impossible by
+      construction and costs ~24 ns per uncontended AddSample (measured, i7-13650HX) —
+      noise against the network send each update represents. The atomic.Pointer swap also
+      restores the invariant — provided each update is a CAS retry loop, since a blind
+      Load-then-Store between two writers loses updates — and gives wait-free readers,
+      but every update allocates a fresh 16-byte pair: at 100k updates/s that is ~1.6
+      MB/s of garbage produced to
+      serve a rate estimator reading ~10 times/s. The swap wins only when reads dominate
+      writes (read-mostly config or routing state); a write-hot meter keeps the Mutex.
+
+limitations: >
+  The buggy version's failure is probabilistic in principle: 15/15 measured runs failed on
+  this box, but a green invariant test elsewhere proves only that THIS checker under THIS
+  load saw no tear — not that none is possible. The a2 CLEAN verdict is the tooling's own
+  limitation on display: -race only reports unsynchronized access pairs, and that program
+  has none by construction — its silence never claims the invariant holds (R4) — 48/50
+  runs observed a torn pair while -race stayed silent, and 2/50 saw no tear at all. The ~24 ns Mutex figure is one uncontended microbenchmark on one box, not a
+  contention study — go05e covers what happens when readers pile onto that lock.

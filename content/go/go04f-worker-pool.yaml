@@ -1,0 +1,453 @@
+# Pilot lesson 6 — authored per content/go/PILOT-CONVENTIONS.md; verify: make verify ID=go04f-worker-pool
+schema_version: 1
+id: go04f-worker-pool
+tag: go04f
+title: "Go: the bounded worker pool — drain on close, abandon on cancel"
+track: go
+week: "Track Go · Module 04/05 (pilot) · Lesson 6"
+priority: attack
+content_rev: 1
+toolchain: { go: "1.26" }
+prerequisites: [go04e-goroutine-leaks]
+altitude: ramp
+summary: >
+  You have built this pool twice already — the bounded-queue thread pool under your HTTP
+  server, forwarder fan-out in conclave. Go's version is n goroutines and ONE two-arm select;
+  the new content is that shutdown is TWO different contracts and each arm implements exactly
+  one: a closed jobs channel means drain the backlog and report all of it; a cancelled ctx
+  means take no new work and return promptly, abandoning the rest. Conflate them and you
+  either lose work or never terminate. This is the conclave anchor lesson — jobs are frames,
+  workers are forwarders — and the shape everything since go04a has been building toward.
+
+learning_objectives:
+  - { id: go04f-o1, bloom: create,   text: "Build Run(ctx, jobs, n) from scratch: -race clean, drains the backlog on close, abandons promptly on cancel, leaks zero workers" }
+  - { id: go04f-o2, bloom: analyze,  text: "Articulate the two shutdown semantics and map each to the select arm that implements it, including what happens to a job already in hand" }
+  - { id: go04f-o3, bloom: evaluate, text: "Defend bounding at n workers against goroutine-per-job with quantified stack, scheduler, and backpressure costs" }
+
+teach:
+  - heading: "Two shutdown contracts, one two-arm select"
+    covers: [go04f-o1, go04f-o2]
+    body: |
+      The pool's whole design is one select with two arms, and each arm implements a
+      DIFFERENT contract. jobs closed is the owner's completion broadcast (go04a): the
+      comma-ok arm sees `ok == false` only after the buffer is drained, so close means
+      finish every backlogged job and report the full count. ctx cancelled is an urgency
+      signal (go04d): take no NEW job and return promptly — whatever still sits in the
+      channel stays there, unread.
+
+      ```go
+      for {
+      	select {
+      	case <-ctx.Done(): // abandon: accept no NEW work; the backlog stays unread
+      		return
+      	case j, ok := <-jobs:
+      		if !ok {
+      			return // drain complete: owner closed and the buffer is empty
+      		}
+      		process(j) // a job already in hand ALWAYS finishes, even if cancel lands now
+      	}
+      }
+      ```
+
+      > [!KEY] Closed jobs = drain: finish the backlog, report all of it. Cancelled ctx = abandon: no NEW work — but the job already in hand still finishes.
+
+      Two consequences you must design for. First, when both arms are ready, select picks
+      uniformly at random (go04c) — after cancel a worker may legally grab another job or
+      two before it observes Done, so "promptly" means bounded by a few jobs, never
+      "instantly". Second, n workers fold into one processed count concurrently:
+      `processed++` on a shared int is a read-modify-write race. atomic.Int64 is the
+      one-line fix (an uncontended Add is single-digit ns); per-worker slots in a []int
+      summed after wg.Wait() is the zero-contention alternative — Done/Wait supplies the
+      happens-before edge that makes the final read safe.
+  - heading: "Why bound at n — this IS conclave's packet fan-out"
+    covers: [go04f-o3]
+    body: |
+      Map it before you defend it: jobs are frames arriving from one peer, workers are the
+      forwarders pushing them to everyone else. A burst is 10,000 frames. The rejected
+      alternative — spawn a goroutine per frame — pays a ~2–8 KB initial stack each:
+      20–80 MB of stacks before a single byte is forwarded, and 10,000 runnables contending
+      for GOMAXPROCS Ps (20 on this box) — run-queue pressure and cache-cold hops. The
+      bounded pool keeps the runnable count at n and the stack bill at n × ~2 KB
+      (8 workers ≈ 16 KB), fixed regardless of burst size.
+
+      The deeper argument is backpressure. A bounded pool makes overload VISIBLE at the
+      source: when all n workers are busy and the buffer is full, the producer blocks on
+      its send — flow control by construction. Goroutine-per-job accepts everything and
+      converts overload into heap growth and GC pressure; you find out from an OOM, not
+      from a blocked send you can measure.
+
+      > [!KEY] The bound IS the backpressure: n workers turn overload into a blocked producer instead of a growing heap.
+
+worked_examples:
+  - id: go04f-w1
+    covers: [go04f-o2]
+    prompt: |
+      Run's 4 workers sit in the two-arm select. ctx is cancelled while jobs (cap 8) still
+      holds 5 values and a producer keeps offering more (each send inside its own select on
+      ctx.Done, per go04d). Walk through what each worker may do next, and what that
+      implies for how a cancel-path test must assert.
+    solution: |
+      Both arms are ready, and select chooses uniformly at random among ready arms — so
+      each worker flips a fair coin per loop iteration: Done (return) or jobs (one more
+      job, fully processed and counted, then flip again). While both arms stay ready the
+      extra-jobs count per worker is geometric: expected ~1, P(k more) ≈ 2^-k, so 3+
+      extras is a 1-in-8 event per worker. Termination is still guaranteed: the producer's
+      own select observes Done and stops, stragglers drain, and Done becomes the only
+      ready arm. Consequence for tests: the drained count on the cancel path is
+      interleaving-dependent, so a correct test asserts processed <= sent AND that Run
+      returns within a deadline (~2 s) — never an exact count.
+
+assessments:
+  - id: go04f-a1
+    type: mcq
+    covers: [go04f-o2]
+    difficulty: medium
+    prompt: |
+      Cancel lands while worker 3 has ALREADY received job #42 from jobs and is halfway
+      through processing it. The other workers are parked in their selects. What does a
+      correct worker 3 do?
+    grading:
+      strategy: deterministic_choice
+      options:
+        - text: "Finish job #42 and count it — cancellation forbids accepting NEW work, not completing the job in hand"
+          correct: true
+          why: "A received job is owned by its worker — that select was already won — so it finishes and counts. The contract's promptness bound is 'within the job in hand (plus select's random stragglers)', not 'mid-instruction'; the worker returns once a later select lands on ctx.Done."
+        - text: "Abort job #42 on the spot and return — cancelled means stop now"
+          correct: false
+          why: "That is abandon-IN-FLIGHT, a different and much harder contract: it needs per-job checkpoint/undo machinery Run never promised. Tearing down mid-job is how you get half-forwarded frames and corrupt partial state."
+        - text: "Finish job #42, then drain whatever is left in jobs before returning — it was already queued"
+          correct: false
+          why: "That is the CLOSE semantics leaking into the cancel path. jobs may be kept fed and never closed; draining it after cancel can simply never terminate. Queued is not accepted — only the job in hand is owed completion."
+        - text: "Send job #42 back into jobs so the work is not lost, then return"
+          correct: false
+          why: "Inside Run, jobs is <-chan int — the type system already forbids the send. Even with a bidirectional channel, re-queuing into a pool whose workers are all leaving either blocks forever once no receiver remains — the go04e leak, self-inflicted — or, with buffer space free, merely strands the value unread."
+    reference_answer: "Finish job #42 and count it — cancellation forbids accepting NEW work, not completing the job in hand"
+
+  - id: go04f-a2
+    type: predict_race_verdict
+    covers: [go04f-o1]
+    difficulty: medium
+    prompt: |
+      The naive pool fold: 8 workers range over one closed jobs channel and bump a shared
+      processed int. A review comment argues "receives are serialized by the channel's
+      internal lock, so the increments are effectively synchronized." Predict the -race
+      verdict.
+    grading:
+      strategy: deterministic_output
+      runner: "go test -race"
+      iterations: 50
+      confidence: probabilistic
+      expected_verdict: race
+      program: |
+        package main
+
+        import (
+        	"fmt"
+        	"sync"
+        )
+
+        // The naive pool fold: 8 workers range one closed jobs channel and bump a
+        // single shared counter. Receives serialize on the channel; the ++ does not.
+        func main() {
+        	const workers = 8
+        	const perWorker = 100
+        	jobs := make(chan int, workers*perWorker)
+        	for i := 0; i < workers*perWorker; i++ {
+        		jobs <- i
+        	}
+        	close(jobs)
+
+        	processed := 0 // the shared fold — this line is on trial
+        	start := make(chan struct{})
+        	var wg sync.WaitGroup
+        	for w := 0; w < workers; w++ {
+        		wg.Add(1)
+        		go func() {
+        			defer wg.Done()
+        			<-start // barrier: all 8 workers contend from the same instant
+        			for range jobs {
+        				processed++
+        			}
+        		}()
+        	}
+        	close(start)
+        	wg.Wait()
+        	fmt.Println(processed)
+        }
+
+  - id: go04f-a3
+    type: code_from_scratch
+    covers: [go04f-o1, go04f-o2]
+    difficulty: hard
+    prompt: |
+      The conclave anchor: build the bounded pool. n workers over jobs. jobs closed means
+      drain — finish every remaining job and return the full count. ctx cancelled means
+      abandon — no new work, return promptly, leave the rest unread. No leaked workers on
+      either path, green under -race. Keep the signature.
+    grading:
+      strategy: hidden_tests
+      language: go
+      starter: |
+        package crucible
+
+        import "context"
+
+        // Run starts n workers that consume jobs and returns how many were processed.
+        //
+        // Contract — two DIFFERENT shutdown semantics, both mandatory:
+        //   - jobs closed   -> drain: finish every remaining job, return the full count.
+        //   - ctx cancelled -> abandon: take no new job and return promptly; a job
+        //     already in a worker's hands is still finished and counted.
+        //
+        // Run must not leak a worker on either path.
+        func Run(ctx context.Context, jobs <-chan int, n int) (processed int) {
+        	// TODO: n workers, one two-arm select each. Mind how you fold the counts.
+        	_ = ctx
+        	_ = jobs
+        	_ = n
+        	return 0
+        }
+      reference_solution: |
+        package crucible
+
+        import (
+        	"context"
+        	"sync"
+        	"sync/atomic"
+        )
+
+        // Run bounds concurrency at n workers. The two-arm select is the whole design:
+        // the jobs arm (comma-ok) implements drain-on-close, the ctx arm implements
+        // abandon-on-cancel. atomic.Int64 folds the count because n workers write it
+        // concurrently — a plain int here is exactly the race a2 convicts.
+        func Run(ctx context.Context, jobs <-chan int, n int) (processed int) {
+        	var count atomic.Int64
+        	var wg sync.WaitGroup
+        	for i := 0; i < n; i++ {
+        		wg.Add(1)
+        		go func() {
+        			defer wg.Done()
+        			for {
+        				select {
+        				case <-ctx.Done(): // abandon: no NEW work; the backlog stays unread
+        					return
+        				case j, ok := <-jobs:
+        					if !ok { // drain complete: owner closed and the buffer is empty
+        						return
+        					}
+        					_ = j // the "work" — counting stands in for processing
+        					count.Add(1)
+        				}
+        			}
+        		}()
+        	}
+        	wg.Wait()
+        	return int(count.Load())
+        }
+      test_code: |
+        package crucible
+
+        import (
+        	"context"
+        	"runtime"
+        	"sync/atomic"
+        	"testing"
+        	"time"
+        )
+
+        // No t.Parallel() anywhere in this file: TestNoWorkerLeak reasons about
+        // runtime.NumGoroutine(), which is only meaningful when tests run alone.
+
+        func TestDrainsAllOnClose(t *testing.T) {
+        	jobs := make(chan int, 100)
+        	for i := 0; i < 100; i++ {
+        		jobs <- i
+        	}
+        	close(jobs)
+        	if got := Run(context.Background(), jobs, 8); got != 100 {
+        		t.Fatalf("Run processed %d, want 100 (close means drain the whole backlog)", got)
+        	}
+        }
+
+        func TestSingleWorkerDrains(t *testing.T) {
+        	jobs := make(chan int, 50)
+        	for i := 0; i < 50; i++ {
+        		jobs <- i
+        	}
+        	close(jobs)
+        	if got := Run(context.Background(), jobs, 1); got != 50 {
+        		t.Fatalf("Run(n=1) processed %d, want 50 (the pool must degrade to a sequential consumer)", got)
+        	}
+        }
+
+        func TestFoldIsExactUnderContention(t *testing.T) {
+        	// 10k jobs across 8 workers: enough concurrent bumps that a lost-update fold
+        	// (count.Store(count.Load()+1), or an unlocked read-modify-write) drops
+        	// increments. -race treats atomics as synchronized and cannot flag a wrongly
+        	// composed pair; exactness under contention can.
+        	const stress = 10000
+        	jobs := make(chan int, stress)
+        	for i := 0; i < stress; i++ {
+        		jobs <- i
+        	}
+        	close(jobs)
+        	if got := Run(context.Background(), jobs, 8); got != stress {
+        		t.Fatalf("Run processed %d, want %d — the fold lost updates under contention", got, stress)
+        	}
+        }
+
+        func TestStopsPromptlyOnCancel(t *testing.T) {
+        	ctx, cancel := context.WithCancel(context.Background())
+        	defer cancel()
+        	jobs := make(chan int) // never closed and kept fed: ctx is the only way out
+        	var sent atomic.Int64
+        	go func() {
+        		for i := 0; ; i++ {
+        			sent.Add(1) // counted BEFORE the send, so processed <= sent at every instant
+        			select {
+        			case jobs <- i:
+        			case <-ctx.Done():
+        				return
+        			}
+        		}
+        	}()
+        	done := make(chan int, 1)
+        	go func() { done <- Run(ctx, jobs, 4) }()
+
+        	// >=10 attempts on an unbuffered channel means >=9 jobs were consumed by workers.
+        	deadline := time.Now().Add(2 * time.Second)
+        	for sent.Load() < 10 {
+        		if time.Now().After(deadline) {
+        			t.Fatalf("workers consumed almost nothing in 2s (sent=%d) — is the pool receiving?", sent.Load())
+        		}
+        		time.Sleep(time.Millisecond)
+        	}
+        	cancel()
+        	select {
+        	case processed := <-done:
+        		if s := int(sent.Load()); processed > s {
+        			t.Fatalf("processed %d > sent %d — the count includes jobs that never existed", processed, s)
+        		}
+        	case <-time.After(2 * time.Second):
+        		t.Fatal("Run did not return within 2s of cancel — cancel must abandon, not drain")
+        	}
+        }
+
+        func TestAbandonLeavesBacklogUnread(t *testing.T) {
+        	// A cancelled pool may legally take a few stragglers (select arms race,
+        	// ~1 expected per worker), but it must not DRAIN a big backlog. 500 of 1000
+        	// is an astronomically generous bound for a correct pool (P(>=500) < 4*2^-125)
+        	// and still convicts drain-on-cancel and jobs-first-priority structures,
+        	// which take all 1000.
+        	jobs := make(chan int, 1000)
+        	for i := 0; i < 1000; i++ {
+        		jobs <- i
+        	}
+        	ctx, cancel := context.WithCancel(context.Background())
+        	cancel() // cancelled BEFORE Run: abandoning the backlog is the only correct behavior
+        	done := make(chan int, 1)
+        	go func() { done <- Run(ctx, jobs, 4) }()
+        	select {
+        	case processed := <-done:
+        		if processed >= 500 {
+        			t.Fatalf("processed %d of a 1000-job backlog after cancel — cancel must abandon the backlog, not drain it (close is the drain signal)", processed)
+        		}
+        	case <-time.After(2 * time.Second):
+        		t.Fatal("Run did not return within 2s of an already-cancelled ctx")
+        	}
+        }
+
+        func TestNoWorkerLeak(t *testing.T) {
+        	baseline := runtime.NumGoroutine()
+
+        	// Drain path.
+        	jobs := make(chan int, 10)
+        	for i := 0; i < 10; i++ {
+        		jobs <- i
+        	}
+        	close(jobs)
+        	if got := Run(context.Background(), jobs, 4); got != 10 {
+        		t.Fatalf("drain path processed %d, want 10", got)
+        	}
+
+        	// Abandon path: ctx cancelled, jobs never closed and never fed.
+        	ctx, cancel := context.WithCancel(context.Background())
+        	idle := make(chan int)
+        	done := make(chan int, 1)
+        	go func() { done <- Run(ctx, idle, 4) }()
+        	cancel()
+        	select {
+        	case got := <-done:
+        		if got != 0 {
+        			t.Fatalf("abandon path processed %d, want 0 (nothing was ever sent)", got)
+        		}
+        	case <-time.After(2 * time.Second):
+        		t.Fatal("Run did not return within 2s of an already-cancelled ctx")
+        	}
+
+        	deadline := time.Now().Add(2 * time.Second)
+        	for runtime.NumGoroutine() > baseline {
+        		if time.Now().After(deadline) {
+        			t.Fatalf("worker leak: %d goroutines at baseline, %d now", baseline, runtime.NumGoroutine())
+        		}
+        		time.Sleep(10 * time.Millisecond)
+        	}
+        }
+      tests:
+        - { name: TestDrainsAllOnClose,     visible: true,  golden: "send 100, close: Run returns exactly 100" }
+        - { name: TestSingleWorkerDrains,   visible: false, golden: "n=1 degrades to a sequential consumer: 50 jobs, close, returns 50" }
+        - { name: TestFoldIsExactUnderContention, visible: false, golden: "10k jobs, 8 workers: fold is exactly 10000 — convicts lost-update RMW folds (Store(Load()+1)) that -race cannot flag" }
+        - { name: TestStopsPromptlyOnCancel, visible: false, golden: "kept-fed never-closed jobs; cancel: returns inside the 2s deadline with processed <= sent" }
+        - { name: TestAbandonLeavesBacklogUnread, visible: false, golden: "ctx cancelled before Run over a 1000-job backlog: returns within 2s having taken well under 500 — convicts drain-on-cancel and jobs-priority selects" }
+        - { name: TestNoWorkerLeak,         visible: false, golden: "NumGoroutine back to baseline after both shutdown paths" }
+      race: true
+      timeout_ms: 15000
+
+  - id: go04f-a4
+    type: explain_tradeoff
+    covers: [go04f-o3]
+    difficulty: hard
+    prompt: |
+      In writing: 10,000 jobs arrive (conclave: a frame burst on the fan-out path). Defend
+      Run's n-bounded worker pool against the rejected alternative — one goroutine per job,
+      "the scheduler is cheap, let it sort them out". Name the alternative explicitly, give
+      its concrete failure modes, and include at least one number (stack bytes, runnable
+      counts, memory totals).
+    grading:
+      strategy: llm_judge
+      judge_mode: rubric
+      rubric:
+        pass_threshold: 0.6
+        criteria:
+          - { id: c1, weight: 0.4, text: "Names goroutine-per-job as the rejected alternative and WHY it is rejected (unbounded concurrency has no backpressure; acceptance converts overload into memory)" }
+          - { id: c2, weight: 0.3, text: "States a concrete failure mode: stack-memory blowup / scheduler oversubscription / OOM instead of a blocked producer" }
+          - { id: c3, weight: 0.3, text: "Includes a quantified claim (~2-8 KB initial stack, 10k goroutines -> tens of MB, runnable count n vs 10k)" }
+        anti_reward_hacking: { min_words: 40, penalize_if_contains: ["as an AI", "it depends"] }
+    reference_answer: |
+      Reject goroutine-per-job. 10,000 jobs is 10,000 goroutines at a ~2–8 KB initial
+      stack each — 20–80 MB of stack before any work happens — and 10,000 runnables
+      contending for 20 Ps (GOMAXPROCS on this box): run-queue pressure, cache-cold
+      scheduling hops, and the GC now scanning every one of those stacks. The sharper
+      failure mode is lost backpressure: a spawner accepts every job, so overload becomes
+      unbounded heap growth and an eventual OOM — invisible until it kills the process.
+      Run's n workers cost n × ~2 KB (8 workers ≈ 16 KB, fixed) and cap runnables at n;
+      when all n are busy the producer blocks on the jobs send, which is flow control by
+      construction — conclave's frame burst becomes a briefly blocked forwarder queue
+      instead of a melting process. Bound n near GOMAXPROCS for CPU-shaped work and raise
+      it only with a measured reason.
+
+limitations: >
+  The cancel-path tests prove "returns within 2 s" plus a statistical bound — fewer than 500
+  of a 1000-job backlog taken post-cancel (a correct pool takes ~1 straggler per worker; a
+  drain-on-cancel or jobs-priority select takes all 1000) — never an exact drained count,
+  which select's uniform arm choice makes unassertable. The in-hand clause is NOT
+  machine-checked: a pool that receives a job, notices cancel, and discards it uncounted
+  passes every test (measured) — only a1 examines that distinction. -race green stays a
+  probabilistic absence of observed races (R4): a2's 50 iterations raise confidence that the
+  naive fold trips (measured 49/50 on this box), they do not prove it always will — and a
+  Store(Load()+1) fold is invisible to -race entirely, which is why the fold-exactness stress
+  convicts by count (measured: 100 jobs caught it in 10/20 runs, 10k jobs in 20/20). The
+  NumGoroutine assertion covers only the exercised shutdown paths, and n == 0 is left
+  unspecified by the contract. Processing here is counting: a green run proves nothing about
+  real per-job work — errors, panics (recover), or per-job timeouts are go05 material. The
+  2–8 KB figures are INITIAL stack sizes; real per-goroutine cost grows with stack depth.

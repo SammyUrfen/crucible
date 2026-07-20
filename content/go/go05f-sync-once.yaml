@@ -1,0 +1,389 @@
+# Pilot lesson 13 — authored per content/go/PILOT-CONVENTIONS.md; verify: make verify ID=go05f-sync-once
+schema_version: 1
+id: go05f-sync-once
+tag: go05f
+title: "Go: sync.Once — check-then-act, done right"
+track: go
+week: "Track Go · Module 05 (pilot) · Lesson 13"
+priority: attack
+content_rev: 1
+toolchain: { go: "1.26" }
+prerequisites: [go05c-happens-before]
+altitude: ramp
+summary: >
+  `if conn == nil { conn = dial() }` is check-then-act — a shape you have rejected in every
+  concurrency review you have ever done. In Go it is worse than a double dial: the plain read
+  and write of conn are a data race, flagged even on runs where only one goroutine dials.
+  sync.Once is the packaged fix, and the half people forget is the ordering guarantee: every
+  Do returns only after f completed, so callers can use the result with no extra sync (the
+  go05c edge, applied). The sharp edge going the other way: a panicking f still counts as
+  done — Once means attempt-once, not succeed-once. Running example: conclave dialing its
+  TURN fallback only when the first direct path fails — init cost you hope never to pay.
+
+learning_objectives:
+  - { id: go05f-o1, bloom: analyze,  text: "Predict sync.Once behavior under failure — Do counts a panicking f as done, blocks concurrent callers until f completes, and never retries" }
+  - { id: go05f-o2, bloom: create,   text: "Replace a racy 'if conn == nil' lazy init with sync.Once, proven exactly-once and race-free under concurrent first use" }
+  - { id: go05f-o3, bloom: evaluate, text: "Choose between package-level var init, init(), and sync.Once for a loading scenario, defending the choice with failure modes and numbers" }
+
+teach:
+  - heading: "lazy init is check-then-act — Do bundles the fix with the ordering edge"
+    covers: [go05f-o2]
+    body: |
+      The racy shape reads a shared pointer, decides, then writes it — two goroutines both
+      see nil and both dial, and every unsynchronized read/write pair is a reportable race
+      besides. The packaged fix:
+
+      ```go
+      var (
+      	connOnce sync.Once
+      	conn     *Conn
+      )
+
+      func GetConn() *Conn {
+      	connOnce.Do(func() { conn = dialFn() })
+      	return conn
+      }
+      ```
+
+      > [!KEY] Do gives TWO guarantees: f runs exactly once, AND every Do returns only after f completed — so the plain read of conn after Do is ordered after the write (go05c). No extra sync.
+
+      The second guarantee is the one hand-rolled replacements drop (the worked example
+      below kills the obvious atomic.Bool version). Two mechanical rules: declare the Once
+      next to the value it guards, and never copy a Once after first use — it carries the
+      done word plus a mutex, a copy forks "done", and `go vet`'s copylocks check flags it.
+  - heading: "panic counts as done — Once means attempt-once, not succeed-once"
+    covers: [go05f-o1]
+    body: |
+      Do marks the Once done on the way out even when f panics: every later Do returns
+      immediately and runs nothing. A failed init is cached as "initialized" — in the
+      lazy-dial pattern, conn stays nil forever and nothing ever retries. That is a design
+      decision, not a bug: retry policy belongs to code that can decide policy, not inside
+      a memory-ordering primitive.
+
+      Go 1.21 wraps the var+Once pair: `var getConn = sync.OnceValue(func() *Conn {...})`
+      collapses three declarations into one, and the two-result `sync.OnceValues` fits the
+      (T, error) shape — but it caches that returned error forever too, and a panicking f
+      re-panics with the same value on every later call. If a failure must be retried, Once is the wrong
+      tool: use a mutex with explicit state that clears on failure so the next caller
+      re-dials.
+  - heading: "choosing: package-level var vs init() vs Once"
+    covers: [go05f-o3]
+    body: |
+      Three initialization tools, one decision axis — when must the cost be paid, and is
+      it always needed?
+
+      - Always needed and cheap → package-level `var cfg = parse()`. Package init
+        happens-before main (go05c), so it is race-free with zero synchronization and
+        zero moving parts.
+      - Must exist before anything else runs (registration, cross-package init order) →
+        `init()`. Demand cannot trigger it; order does.
+      - Expensive and possibly never needed → sync.Once. conclave's TURN fallback is the
+        canonical case: a ~200 ms dial plus a credential fetch that only the ~15% of
+        sessions behind hostile NAT ever need. After first use, Do's fast path is a
+        single atomic load (~1 ns) — laziness costs the hot path nothing measurable.
+
+      Once-by-default is a smell: it adds an atomic load and an indirection where package
+      init already gives free, race-free ordering — and it imports the panic-counts-as-done
+      edge for no benefit.
+
+worked_examples:
+  - id: go05f-w1
+    covers: [go05f-o1]
+    prompt: |
+      A reviewer replaces sync.Once with "cheaper" atomics:
+
+      ```go
+      var started atomic.Bool
+
+      func GetConn() *Conn {
+      	if started.CompareAndSwap(false, true) {
+      		conn = dialFn()
+      	}
+      	return conn
+      }
+      ```
+
+      dialFn still runs exactly once — the CAS guarantees that much. Two goroutines hit
+      GetConn concurrently on first use. Walk through what the CAS loser observes, and name
+      the half of Once's contract this version drops.
+    solution: |
+      The loser's CAS fails, so it skips the dial branch and returns conn immediately —
+      while the winner is still inside the ~200 ms dial. The loser gets nil, and its plain
+      read of conn races with the winner's later write (-race flags it: the CAS
+      synchronizes the flag, not conn). Exactly-once was never the hard part. Once's second
+      guarantee — Do BLOCKS every caller until f completed, then publishes f's writes
+      (go05c) — is what makes the result safe to use. Exactly-once without wait-until-done
+      fails precisely on concurrent first use, the only case the pattern exists for.
+
+assessments:
+  - id: go05f-a1
+    type: predict_output
+    covers: [go05f-o1]
+    difficulty: medium
+    prompt: |
+      Single goroutine, fully deterministic. Predict the exact stdout, line by line (every
+      line comes from fmt.Println).
+    grading:
+      strategy: deterministic_output
+      runner: "go run"
+      match: trimmed
+      program: |
+        package main
+
+        import (
+        	"fmt"
+        	"sync"
+        )
+
+        func main() {
+        	var once sync.Once
+        	ran := 0
+
+        	attempt := func(name string, f func()) {
+        		defer func() {
+        			if r := recover(); r != nil {
+        				fmt.Println("recovered:", r)
+        			}
+        		}()
+        		once.Do(f)
+        		fmt.Println(name, "Do returned")
+        	}
+
+        	attempt("first", func() {
+        		ran++
+        		fmt.Println("f1: dialing")
+        		panic("dial failed")
+        	})
+        	attempt("second", func() {
+        		ran++
+        		fmt.Println("f2: dialing")
+        	})
+
+        	fmt.Println("ran:", ran)
+        }
+      expected_output: |
+        f1: dialing
+        recovered: dial failed
+        second Do returned
+        ran: 1
+
+  - id: go05f-a2
+    type: debug_this
+    covers: [go05f-o2]
+    difficulty: medium
+    prompt: |
+      conclave's TURN fallback: GetConn() lazily dials the relay the first time any peer
+      path needs it. Under concurrent first use this version is wrong twice over: -race
+      flags it, and two sessions can each pay the ~200 ms dial. Fix GetConn so the dial
+      happens exactly once, stays lazy, and every caller gets the completed connection.
+      Keep the Conn type, GetConn's signature, and the dialFn seam — dial by calling
+      dialFn() at first use, never at package init (the tests count dials through the
+      seam). sync.Once is the idiomatic tool; a correct mutex or sync.OnceValue solution
+      passes too — the tests assert behavior only.
+    grading:
+      strategy: hidden_tests
+      language: go
+      buggy: |
+        package crucible
+
+        // Conn stands in for an expensive resource: conclave's TURN fallback relay
+        // (~200 ms dial + a credential fetch) that most sessions never need.
+        type Conn struct {
+        	Addr string
+        }
+
+        // dialFn is the dial seam. Tests swap it to count real dials — dial by
+        // calling dialFn() at first use, never at package init.
+        var dialFn = func() *Conn {
+        	return &Conn{Addr: "turn.conclave.example:3478"}
+        }
+
+        var conn *Conn
+
+        // GetConn returns the process-wide relay connection, dialing on first use.
+        func GetConn() *Conn {
+        	if conn == nil { // check ...
+        		conn = dialFn() // ... then act: a second goroutine saw nil too
+        	}
+        	return conn
+        }
+      reference_solution: |
+        package crucible
+
+        import "sync"
+
+        // Conn stands in for an expensive resource: conclave's TURN fallback relay
+        // (~200 ms dial + a credential fetch) that most sessions never need.
+        type Conn struct {
+        	Addr string
+        }
+
+        // dialFn is the dial seam. Tests swap it to count real dials — dial by
+        // calling dialFn() at first use, never at package init.
+        var dialFn = func() *Conn {
+        	return &Conn{Addr: "turn.conclave.example:3478"}
+        }
+
+        // connOnce owns both halves of the contract: dialFn runs exactly once, and
+        // every Do returns only after it completed — so the plain read of conn below
+        // is ordered after the write (the go05c happens-before edge, packaged).
+        var (
+        	connOnce sync.Once
+        	conn     *Conn
+        )
+
+        // GetConn returns the process-wide relay connection, dialing on first use.
+        func GetConn() *Conn {
+        	connOnce.Do(func() {
+        		conn = dialFn()
+        	})
+        	return conn
+        }
+      test_code: |
+        package crucible
+
+        import (
+        	"runtime"
+        	"sync"
+        	"sync/atomic"
+        	"testing"
+        )
+
+        // dialCount counts real dials. The swap happens in init(), which runs after
+        // package-var initialization and before any test — so laziness is observable:
+        // a solution that dials at package init never reaches this counting seam.
+        var dialCount atomic.Int64
+
+        func init() {
+        	dialFn = func() *Conn {
+        		dialCount.Add(1)
+        		runtime.Gosched() // a real dial takes ~200 ms; widen the window it models
+        		return &Conn{Addr: "turn.test:0"}
+        	}
+        }
+
+        func TestConcurrentFirstUseDialsOnce(t *testing.T) {
+        	if got := dialCount.Load(); got != 0 {
+        		t.Fatalf("dialFn ran %d time(s) before the first GetConn — the dial must stay lazy", got)
+        	}
+        	const goroutines = 64
+        	start := make(chan struct{})
+        	var wg sync.WaitGroup
+        	for i := 0; i < goroutines; i++ {
+        		wg.Add(1)
+        		go func() {
+        			defer wg.Done()
+        			<-start // barrier: every goroutine hits first use together
+        			for j := 0; j < 100; j++ {
+        				if GetConn() == nil {
+        					t.Error("GetConn returned nil")
+        					return
+        				}
+        			}
+        		}()
+        	}
+        	close(start)
+        	wg.Wait()
+        	if got := dialCount.Load(); got != 1 {
+        		t.Fatalf("dialFn ran %d times under concurrent first use, want exactly 1", got)
+        	}
+        }
+
+        func TestSameInstanceSteadyState(t *testing.T) {
+        	const goroutines = 16
+        	conns := make(chan *Conn, goroutines)
+        	var wg sync.WaitGroup
+        	for i := 0; i < goroutines; i++ {
+        		wg.Add(1)
+        		go func() {
+        			defer wg.Done()
+        			conns <- GetConn()
+        		}()
+        	}
+        	wg.Wait()
+        	close(conns)
+        	first := GetConn()
+        	if first == nil {
+        		t.Fatal("GetConn returned nil")
+        	}
+        	for c := range conns {
+        		if c != first {
+        			t.Fatalf("two callers hold different connections: %p vs %p", c, first)
+        		}
+        	}
+        	if got := dialCount.Load(); got != 1 {
+        		t.Fatalf("dialFn total is %d after steady-state calls, want still exactly 1", got)
+        	}
+        }
+      tests:
+        - { name: TestConcurrentFirstUseDialsOnce, visible: true,  golden: "64 goroutines behind a start barrier; dialFn runs exactly once; -race clean" }
+        - { name: TestSameInstanceSteadyState,     visible: false, golden: "every caller gets the same *Conn and the dial count stays 1 in steady state" }
+      race: true
+      timeout_ms: 10000
+
+  - id: go05f-a3
+    type: mcq
+    covers: [go05f-o3]
+    difficulty: medium
+    prompt: |
+      Three loading scenarios from conclave. For which ONE is sync.Once the right tool —
+      beating BOTH a package-level `var x = load()` and an `init()` function?
+    grading:
+      strategy: deterministic_choice
+      options:
+        - text: "Parsing the static ICE-server config (~2 KB, ~1 ms) that every session reads at startup"
+          correct: false
+          why: "Always needed and cheap: a package-level `var cfg = parse()` pays the 1 ms before main even starts, is race-free with zero synchronization (package init happens-before main, go05c), and has no moving parts. Once buys nothing here and adds an atomic load to every access."
+        - text: "Building the ~30 MB symbolization table for the failure-diagnostics bundle that only the ~2% of sessions that hit a failure ever upload"
+          correct: true
+          why: "Expensive and almost never needed: lazy Do defers the ~1 s build and 30 MB of RSS to the ~2% of sessions that actually fail, first-use latency is irrelevant inside a failure path, and Do's completion guarantee means two goroutines reporting at once both get the completed table."
+        - text: "Registering the VP8 payload handler in a package-level codec registry that must be populated before any signaling handler runs"
+          correct: false
+          why: "Ordering-driven, not demand-driven: 'populated before anything runs' is exactly what init()/package-var order already guarantees. Lazy registration inverts the requirement — the first lookup would have to know to trigger it."
+        - text: "All three — package-level state should default to sync.Once for safety"
+          correct: false
+          why: "Once-by-default adds an atomic load and an indirection where package init already gives free, race-free ordering — and its panic-counts-as-done semantics can silently cache a failed load forever."
+    reference_answer: "Building the ~30 MB symbolization table for the failure-diagnostics bundle that only the ~2% of sessions that hit a failure ever upload"
+
+  - id: go05f-a4
+    type: explain_tradeoff
+    covers: [go05f-o3]
+    difficulty: hard
+    prompt: |
+      In writing: conclave dials its TURN fallback lazily with sync.Once. Defend that
+      against BOTH rejected alternatives — (a) eager `var conn = dial()` at package level,
+      (b) an init() function that dials. Name each one's concrete failure mode, state the
+      nuance that makes Once the WRONG tool when the dial can fail and must be retried,
+      and include at least one number.
+    grading:
+      strategy: llm_judge
+      judge_mode: rubric
+      rubric:
+        pass_threshold: 0.6
+        criteria:
+          - { id: c1, weight: 0.4, text: "Names both rejected alternatives and WHY each is wrong here (eager var and init() both pay the dial on every process start and couple startup to relay reachability)" }
+          - { id: c2, weight: 0.3, text: "States concrete failure modes: startup latency or startup failure on an unreachable relay for the eager paths, AND Once's panic-counts-as-done / cached-error no-retry edge" }
+          - { id: c3, weight: 0.3, text: "Includes a quantified claim (dial cost, fraction of sessions needing TURN, or Do fast-path cost)" }
+        anti_reward_hacking: { min_words: 40, penalize_if_contains: ["as an AI", "it depends"] }
+    reference_answer: |
+      Eager `var conn = dial()` and a dialing init() both pay the ~200 ms relay dial on
+      every process start and couple startup health to TURN reachability: an unreachable
+      relay now slows or fails startup for the ~85% of sessions that never relay a packet
+      (and a package-level dial cannot be intercepted by tests — the seam is gone before
+      any test runs). Lazy connOnce.Do defers that cost to the ~15% of sessions that need
+      it, and its steady-state fast path is one atomic load (~1 ns) — hot-path callers pay
+      nothing measurable. The honest limit: Do counts a panicking f as done and
+      sync.OnceValues caches a returned error forever, so a dial that can fail and must be
+      retried makes Once the wrong tool — use a mutex with explicit conn/err state that
+      clears on failure so the next caller re-dials.
+
+limitations: >
+  The debug_this -race trip is probabilistic in principle (R4): 64 goroutines behind a start
+  barrier made the buggy version fail 10/10 runs in the latest measured battery, but the two
+  failure signals are not equally reliable — the DATA RACE report fired 10/10, the observable
+  double dial only 9/10 — and either alone fails the run; a green -race run remains an
+  absence of observed races, not a proof. The tests never exercise a panicking dialFn, so
+  passing them does not prove your solution handles a failed first dial (a Once whose f
+  panicked serves nil forever — that path is assessed only on paper, in a1/a4). And the
+  ~1 ns fast-path, ~200 ms dial, and MCQ scenario figures are order-of-magnitude scenario
+  numbers, not benchmarks run here.

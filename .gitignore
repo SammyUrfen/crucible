@@ -1,0 +1,14 @@
+# Pilot scratch runs: throwaway Go modules composed at grade time
+pilot/scratch/
+
+# Phase 1+ compiled lesson JSON (derived from YAML inside the gate; never hand-edited)
+build/
+
+# Python
+__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+
+# Secrets
+.env

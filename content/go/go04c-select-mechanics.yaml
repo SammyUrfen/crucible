@@ -1,0 +1,416 @@
+# Pilot lesson — authored per content/go/PILOT-CONVENTIONS.md; verify: make verify ID=go04c-select-mechanics
+schema_version: 1
+id: go04c-select-mechanics
+tag: go04c
+title: "Go: select — default, nil channels, and what blocks when"
+track: go
+week: "Track Go · Module 04 (pilot) · Lesson 3"
+priority: attack
+content_rev: 1
+toolchain: { go: "1.26" }
+prerequisites: [go04b-buffered-or-rendezvous]
+altitude: ramp
+summary: >
+  select is Go's event-loop multiplexer — the statement conclave's SFU loop is built on
+  (peer-join, peer-leave, shutdown, one wait). You have written this loop against epoll;
+  what is new is the rulebook: among READY cases the runtime chooses uniformly at random
+  (case order is never priority), default fires only when nothing is ready, a nil
+  channel's case can never fire, and a closed channel is permanently ready. The last two
+  are one mechanism read twice — closed = always on, nil = always off — and flipping a
+  finished input from the first state to the second is how a draining loop terminates.
+
+learning_objectives:
+  - { id: go04c-o1, bloom: analyze,  text: "Predict select behavior across ready, empty, closed, and nil cases, with and without default" }
+  - { id: go04c-o2, bloom: create,   text: "Build a two-input merge that drains until both inputs close, using nil-ing to disable finished cases, and terminates cleanly" }
+  - { id: go04c-o3, bloom: evaluate, text: "Choose among default-drop, buffered queue, and blocking send for a hot-path emit, defending the choice against stated latency/loss requirements" }
+
+teach:
+  - heading: "four rules, no priority"
+    covers: [go04c-o1]
+    body: |
+      select looks like switch and behaves nothing like it. Four rules decide every
+      instance:
+
+      1. **Readiness only.** If exactly one case is ready it runs. If SEVERAL are ready
+         the runtime picks uniformly at random — deliberately, so a busy case cannot
+         starve the others. Source order is documentation, never priority.
+      2. **default = poll.** A default arm fires only when no case is ready. It converts
+         "wait for an event" into "check for an event" — which also means default in a
+         bare loop is a 100%-CPU spin.
+      3. **nil never fires.** Send and receive on a nil channel block forever, so a case
+         whose channel expression is nil cannot be chosen. That is not a footgun — it is
+         the off switch for a case, and the only one select has.
+      4. **closed always fires.** Receive from a closed channel is ready forever —
+         buffered values drain first, then it is 0, ok=false immediately, every time
+         (go04a). A finished input is the LOUDEST case in a select, not a silent one.
+
+      > [!KEY] Ready cases → uniform random. Nothing ready → default if present, else block. nil never fires; closed always fires.
+
+      conclave's SFU event loop is exactly this shape: select over peer-join, peer-leave,
+      and shutdown. Rule 1 has a design consequence — if shutdown and a join are ready in
+      the same instant, join can win the coin flip. Your shutdown arm must tolerate one
+      more event having been processed first; no case ordering will "prioritize" shutdown
+      for you.
+  - heading: "nil-ing: how a draining loop terminates"
+    covers: [go04c-o2]
+    body: |
+      Rules 3 and 4 combine into the standard merge/drain pattern. Naive draining spins:
+      once input a closes, its case is ready on EVERY iteration (rule 4), so the loop
+      burns a core receiving 0,false forever. You cannot delete a case at runtime — but
+      you can nil the channel variable, and rule 3 disables it:
+
+      ```go
+      func merge(a, b <-chan int, out chan<- int) {
+      	for a != nil || b != nil {
+      		select {
+      		case v, ok := <-a:
+      			if !ok {
+      				a = nil // finished input: case off; select now ignores it
+      				continue
+      			}
+      			out <- v
+      		case v, ok := <-b:
+      			if !ok {
+      				b = nil
+      				continue
+      			}
+      			out <- v
+      		}
+      	}
+      	close(out) // sole remaining sender closes — the go04a ownership rule
+      }
+      ```
+
+      The loop condition is the termination proof: each close flips one variable to nil,
+      and when both are nil nothing can ever fire again. In conclave this is how the SFU
+      loop retires one peer's event stream without rebuilding the select — flip that
+      peer's channel to nil and keep servicing everyone else.
+
+      > [!KEY] closed = case always on, nil = case off. A drain loop terminates by nil-ing each finished input; all-nil is its proof of done.
+  - heading: "the emit path: block, buffer, or drop"
+    covers: [go04c-o3]
+    body: |
+      A sender facing a possibly-slow consumer has exactly three shapes, and the
+      requirement — not taste — picks one:
+
+      - **Blocking send** (`ch <- s`): backpressure. The sender inherits the consumer's
+        worst stall, transitively. Correct default when losing data is unacceptable and
+        the caller may wait.
+      - **Buffered queue** (`make(chan T, n)`): absorbs bursts up to n, then IS a
+        blocking send. Buffering changes WHEN a send blocks, never WHETHER — n is a
+        claim about burst length, and an unmeasured n is a guess wearing a number.
+      - **Try-send** (`select` + `default`): hard latency bound — one readiness check,
+        never a wait — at the price of explicit loss. Idiomatic ONLY with a drop
+        counter, so the loss is a measured rate instead of a mystery.
+
+      > [!KEY] Buffering moves the blocking later; only default (accepting loss) removes it.
+
+      conclave's upload meter is the canonical case: a per-packet bandwidth sample
+      emitted from the forwarding hot path. A 10 ms consumer stall (stats snapshot
+      hitting disk) must cost the media loop 0 ms, and a lost sample costs accuracy of a
+      gauge that refreshes every second anyway — requirements that name
+      try-send-with-default before you finish reading them.
+
+worked_examples:
+  - id: go04c-w1
+    covers: [go04c-o1]
+    prompt: |
+      One select, three arms: receive from a channel closed two lines earlier, receive
+      from a nil channel variable, and a default. Which arm runs — and why is the answer
+      deterministic when rule 1 says "uniform random"?
+    solution: |
+      The closed-channel arm, immediately, binding the zero value with ok=false. Rule 4
+      makes it ready forever; rule 3 removes the nil arm from consideration entirely;
+      default loses because it fires only when NO case is ready (rule 2). Uniform random
+      applies among READY cases — here that set has exactly one member, so the coin flip
+      has one side. One-ready-case-by-construction is the only shape in which a select's
+      behavior is ever a fair prediction question.
+
+assessments:
+  - id: go04c-a1
+    type: predict_output
+    covers: [go04c-o1]
+    difficulty: easy
+    prompt: |
+      Every select below has exactly one ready case by construction. Reason from the
+      four rules and predict the exact stdout (three lines).
+    grading:
+      strategy: deterministic_output
+      runner: "go run"
+      match: trimmed
+      program: |
+        package main
+
+        import "fmt"
+
+        func main() {
+        	events := make(chan int)
+        	close(events)
+        	var disabled chan int
+
+        	select {
+        	case v, ok := <-events:
+        		fmt.Println("events:", v, ok)
+        	case v := <-disabled:
+        		fmt.Println("disabled:", v)
+        	}
+
+        	queue := make(chan int, 1)
+        	select {
+        	case v := <-queue:
+        		fmt.Println("queue:", v)
+        	default:
+        		fmt.Println("no sample ready")
+        	}
+
+        	queue <- 42
+        	select {
+        	case v := <-queue:
+        		fmt.Println("queue:", v)
+        	default:
+        		fmt.Println("no sample ready")
+        	}
+        }
+      expected_output: |
+        events: 0 false
+        no sample ready
+        queue: 42
+
+  - id: go04c-a2
+    type: code_completion
+    covers: [go04c-o2]
+    difficulty: medium
+    prompt: |
+      Complete Merge2 so it receives every value from BOTH inputs until both are closed,
+      then returns. Use the nil-channel pattern: comma-ok detects a finished input,
+      nil-ing disables its case. Arrival order is unspecified — the tests sort before
+      comparing. It must return promptly once both inputs close (a 2-second deadline
+      treats "still running" as a hang).
+    grading:
+      strategy: hidden_tests
+      language: go
+      starter: |
+        package crucible
+
+        // Merge2 returns every value received from a and b, in unspecified order,
+        // returning only after BOTH inputs are closed and drained. It must not spin
+        // on a finished input and must not hang once both are done.
+        func Merge2(a, b <-chan int) []int {
+        	var out []int
+        	// TODO: loop + select over a and b. comma-ok tells you an input is
+        	// finished; the nil-channel rule is how you switch its case off.
+        	return out
+        }
+      reference_solution: |
+        package crucible
+
+        // Merge2 drains a and b until both are closed. A closed channel is always
+        // ready (rule 4), so a finished input would win the select forever; setting
+        // its local variable to nil (rule 3) disables that case. The loop condition
+        // is the termination proof: both nil means nothing can ever fire again.
+        func Merge2(a, b <-chan int) []int {
+        	var out []int
+        	for a != nil || b != nil {
+        		select {
+        		case v, ok := <-a:
+        			if !ok {
+        				a = nil
+        				continue
+        			}
+        			out = append(out, v)
+        		case v, ok := <-b:
+        			if !ok {
+        				b = nil
+        				continue
+        			}
+        			out = append(out, v)
+        		}
+        	}
+        	return out
+        }
+      test_code: |
+        package crucible
+
+        import (
+        	"slices"
+        	"testing"
+        	"time"
+        )
+
+        // feed sends vals then closes — the sender owns the close (go04a).
+        func feed(ch chan<- int, vals ...int) {
+        	for _, v := range vals {
+        		ch <- v
+        	}
+        	close(ch)
+        }
+
+        // runMerge fails the test instead of hanging it if Merge2 never returns.
+        func runMerge(t *testing.T, a, b chan int) []int {
+        	t.Helper()
+        	done := make(chan []int, 1)
+        	go func() { done <- Merge2(a, b) }()
+        	select {
+        	case got := <-done:
+        		return got
+        	case <-time.After(2 * time.Second):
+        		t.Fatal("Merge2 did not return within 2s: it must service BOTH inputs from one select loop (a sequential drain deadlocks an interleaved producer), disable a finished input, and terminate once both are done")
+        		return nil
+        	}
+        }
+
+        func TestMerge2AllValuesDelivered(t *testing.T) {
+        	a := make(chan int)
+        	b := make(chan int)
+        	go feed(a, 1, 2, 3)
+        	go feed(b, 4, 5, 6)
+        	got := runMerge(t, a, b)
+        	slices.Sort(got)
+        	want := []int{1, 2, 3, 4, 5, 6}
+        	if !slices.Equal(got, want) {
+        		t.Fatalf("sorted Merge2 = %v, want %v (every value from both inputs, exactly once)", got, want)
+        	}
+        }
+
+        func TestMerge2ReturnsWhenBothClose(t *testing.T) {
+        	a := make(chan int)
+        	b := make(chan int)
+        	close(a)
+        	close(b)
+        	if got := runMerge(t, a, b); len(got) != 0 {
+        		t.Fatalf("Merge2 on two closed-empty inputs = %v, want empty", got)
+        	}
+        }
+
+        func TestMerge2OneClosesImmediately(t *testing.T) {
+        	a := make(chan int)
+        	b := make(chan int)
+        	close(a)
+        	// 12 values, not 3: an early-return bug must win 12 straight coin flips
+        	// against the always-ready closed case to slip through (~0.02%).
+        	want := make([]int, 0, 12)
+        	for i := 7; i <= 18; i++ {
+        		want = append(want, i)
+        	}
+        	go feed(b, want...)
+        	got := runMerge(t, a, b)
+        	slices.Sort(got)
+        	if !slices.Equal(got, want) {
+        		t.Fatalf("sorted Merge2 = %v, want %v (an input finishing early must not end the whole merge)", got, want)
+        	}
+        }
+
+        func TestMerge2InterleavedProducer(t *testing.T) {
+        	a := make(chan int)
+        	b := make(chan int)
+        	go func() {
+        		// ONE producer alternating across both unbuffered channels: each send
+        		// rendezvouses, so a merge that drains a then b (no select) deadlocks
+        		// on the first b-send. Only servicing both inputs concurrently passes.
+        		for i := 1; i <= 20; i++ {
+        			if i%2 == 1 {
+        				a <- i
+        			} else {
+        				b <- i
+        			}
+        		}
+        		close(a)
+        		close(b)
+        	}()
+        	got := runMerge(t, a, b)
+        	slices.Sort(got)
+        	want := make([]int, 0, 20)
+        	for i := 1; i <= 20; i++ {
+        		want = append(want, i)
+        	}
+        	if !slices.Equal(got, want) {
+        		t.Fatalf("sorted Merge2 = %v, want 1..20 (values arrive interleaved across both inputs)", got)
+        	}
+        }
+      tests:
+        - { name: TestMerge2AllValuesDelivered,   visible: true,  golden: "3+3 values in, sorted result == [1 2 3 4 5 6]" }
+        - { name: TestMerge2ReturnsWhenBothClose, visible: true,  golden: "both inputs closed empty: returns promptly with no values" }
+        - { name: TestMerge2OneClosesImmediately, visible: false, golden: "a closed at t=0 while b feeds 12 values: all of b delivered, then return" }
+        - { name: TestMerge2InterleavedProducer,  visible: false, golden: "one producer alternates unbuffered sends on a and b: a sequential drain deadlocks; a select merge delivers 1..20" }
+      race: true
+      timeout_ms: 10000
+
+  - id: go04c-a3
+    type: mcq
+    covers: [go04c-o3]
+    difficulty: medium
+    prompt: |
+      conclave's upload meter: the packet-forwarding goroutine emits a bandwidth sample
+      per packet (~100k packets/s) into a metrics channel; the stats consumer usually
+      stalls ~10 ms writing a snapshot, but disk hiccups have wedged it for 2+ seconds
+      in testing. Requirements: forwarding must NEVER wait on metrics — whatever state
+      the consumer is in — and losing samples is acceptable (the gauge refreshes every
+      second). The idiomatic emit is...
+    grading:
+      strategy: deterministic_choice
+      options:
+        - text: "Try-send: select with default — drop the sample and increment a drop counter when the channel is full"
+          correct: true
+          why: "One readiness check on the hot path, a hard 0-wait bound by rule 2, and the counter turns the accepted loss into a measured rate instead of a silent one."
+        - text: "Blocking send on an unbuffered channel — the consumer is almost always ready"
+          correct: false
+          why: "'Almost always' is the problem: every ~10 ms snapshot stall is injected verbatim into the forwarding loop, and the 2 s wedge freezes media forwarding for 2 s — the one stated requirement (never wait) is violated by design."
+        - text: "A large buffered channel (say 65,536 samples) so the sender never actually waits"
+          correct: false
+          why: "Sized against the usual 10 ms stall (1,000 samples at 100k/s) that is 65× headroom — but the 2 s wedge arrives at 200,000 samples, overflows it, and the hot path blocks anyway. Buffering moves WHEN a send blocks, never WHETHER; no finite n buys 'never' against an unbounded stall, and a full queue is 0.65 s of stale history feeding the gauge."
+        - text: "go func() { metrics <- s }() per sample, so the forwarding goroutine itself never waits"
+          correct: false
+          why: "The caller never blocks, but every sample the wedged consumer can't take parks a goroutine: 2 s at 100k/s ≈ 200,000 parked senders (~2 KB stack each ≈ 400 MB), and delivery order is gone — unbounded cost to dodge a bounded, acceptable loss."
+    reference_answer: "Try-send: select with default — drop the sample and increment a drop counter when the channel is full"
+
+  - id: go04c-a4
+    type: explain_tradeoff
+    covers: [go04c-o3]
+    difficulty: hard
+    prompt: |
+      In writing: defend try-send-with-default for conclave's upload-meter emit path
+      against BOTH rejected alternatives — (a) a blocking send, (b) a large buffered
+      queue. State each one's concrete failure mode under a stalled consumer, say what
+      the drop counter buys you, and include at least one number.
+    grading:
+      strategy: llm_judge
+      judge_mode: rubric
+      rubric:
+        pass_threshold: 0.6
+        criteria:
+          - { id: c1, weight: 0.4, text: "Names both rejected alternatives and WHY each fails the never-block requirement (blocking send inherits consumer stalls; a buffer only defers the blocking and adds staleness)" }
+          - { id: c2, weight: 0.3, text: "States a concrete failure mode: consumer stall propagated into the hot path, buffer-full send blocking anyway, or the gauge lagging reality" }
+          - { id: c3, weight: 0.3, text: "Includes a quantified claim (stall ms, buffer capacity/memory/staleness, cost of a failed try-send, drop rate) and mentions counting the drops" }
+        anti_reward_hacking: { min_words: 40, penalize_if_contains: ["as an AI", "it depends"] }
+    reference_answer: |
+      The requirement is a hard never-wait on the forwarding path plus tolerance for
+      sample loss, and only try-send satisfies both. (a) Blocking send is rejected
+      because the sender inherits the consumer's worst stall transitively: every ~10 ms
+      stats-snapshot write becomes a 10 ms freeze of the media loop, and the observed
+      2 s disk-hiccup wedge becomes a 2 s freeze — jitter injected by a metrics gauge.
+      (b) A large buffer (say 65,536) is rejected because buffering changes when the
+      send blocks, never whether: that same 2 s wedge at 100k samples/s is 200,000
+      samples — past any capacity sized for the usual 10 ms burst — so the hot path
+      blocks anyway, and a full queue means the gauge is reading history up to 0.65 s
+      stale — a metric that lags reality lies.
+      Try-send costs one readiness check (~tens of ns on the failed path), bounds sender
+      latency at effectively 0 independent of consumer health, and the drop counter
+      converts the accepted loss into a measured rate — if drops exceed ~1% you resize
+      the buffer from data, not guesswork.
+
+limitations: >
+  The predict item proves rule-application only where exactly ONE case is ready by
+  construction — it deliberately never exercises the two-ready coin flip, because that
+  output is uniform-random and ungradeable (any lesson asking you to predict it is
+  broken). Merge2's tests prove delivery and termination for exactly 2 inputs; they say
+  nothing about fairness or arrival order (unspecified by design, hence the sort), and a
+  green -race run remains a probabilistic absence of observed races (R4). They pin the
+  observable contract, not the taught mechanism: a done-flags variant that leaves the
+  closed case armed (spinning instead of nil-ing) passes every test — CPU burn is
+  invisible to a pass/fail harness — and a goroutine-per-input fan-in passes too, being
+  a correct merge by a different (also idiomatic) route. The interleaved-producer test
+  does kill any select-free sequential drain (deterministic deadlock), and the
+  early-close test's 12 values put an early-return bug's escape odds near 2^-12. The
+  emit-path verdict is contingent on the STATED requirements: flip "loss acceptable" to "lossless"
+  and the correct answer becomes blocking send or a measured bounded buffer — the skill
+  graded here is matching mechanism to requirement, not a universal ranking of the three.

@@ -1,0 +1,254 @@
+# Pilot lesson 9 — authored per content/go/PILOT-CONVENTIONS.md; verify: make verify ID=go05b-race-detector
+schema_version: 1
+id: go05b-race-detector
+tag: go05b
+title: "Go: -race — what a red run proves, what a green run never does"
+track: go
+week: "Track Go · Module 05 (pilot) · Lesson 9"
+priority: attack
+content_rev: 1
+toolchain: { go: "1.26" }
+prerequisites: [go05a-primitive-discrimination]
+altitude: ramp
+summary: >
+  You already run `go test -race` by habit in conclave — this lesson calibrates what that badge
+  is worth. -race links a vector-clock happens-before checker into the binary: when it fires it
+  has PROVEN a data race in the execution it watched; when it stays green it has only failed to
+  observe one, on the interleavings and inputs that actually ran. Red is a proof, green is
+  silence. The grading here practices what it preaches: both race items run 50 iterations and
+  report their verdict as probabilistic (R4).
+
+learning_objectives:
+  - { id: go05b-o1, bloom: analyze,  text: "Predict the -race verdict for short contended programs (plain-int racy vs atomic clean) and defend the prediction from happens-before mechanics, not timing folklore" }
+  - { id: go05b-o2, bloom: evaluate, text: "State precisely what a red and a green -race run each prove, and place -race in a gate given its documented ~5-10x memory / ~2-20x CPU overhead" }
+
+teach:
+  - heading: "red is a proof: vector clocks over accesses that actually ran"
+    covers: [go05b-o1]
+    body: |
+      `-race` (on test, run, or build) compiles ThreadSanitizer's runtime into the binary.
+      Every memory access and every synchronization op (channel send/receive, Lock/Unlock,
+      atomics, WaitGroup) updates a vector clock; a report fires when two accesses touch the
+      same address, at least one is a write, and neither happens-before the other. No sampling,
+      no heuristics — a report is a machine-checked proof that THIS execution raced, and the
+      whole process exits with status 66 so CI cannot miss it.
+
+      > [!KEY] -race needs the conflicting accesses to EXECUTE, not to collide in time: unordered-in-happens-before is enough, even if they ran seconds apart.
+
+      Measured on this box (go1.26.4, 20 CPUs): two goroutines that each increment a plain int
+      ONCE — no barrier, no loop — tripped 60/60, because nothing ordered the pair no matter
+      who ran first. What actually silences the detector on racy code: the racy path not
+      executing at all, or an incidental sync edge in this run's interleaving (a channel or
+      mutex edge another schedule would not have) ordering the pair. That is why the graded
+      race items here park contenders on a shared start channel and loop the access 200x each
+      — no edge to get lucky on: 50/50 trips measured. A construction that trips 3/50 is still
+      a real race; it is just a bad exam question.
+
+  - heading: "green is silence — and the proof machine costs 5-10x memory, 2-20x CPU"
+    covers: [go05b-o2]
+    body: |
+      A green run says exactly: zero races observed, on the interleavings and inputs these
+      executions exercised. Three doors stay open, all structural: (1) code the run never
+      executed — a race in conclave's SFU-migration path contributes nothing while no test
+      drives a migration; (2) an interleaving whose incidental sync edges ordered the pair
+      this time; (3) the detector's bounded per-address access history, which can evict the
+      older half of a conflicting pair under heavy access traffic. None of these is a -race
+      bug; they are the price of checking executions instead of programs (the formal memory
+      model is go05c's job).
+
+      The documented price of the proof machine: ~5-10x memory, ~2-20x CPU. That envelope
+      decides placement:
+
+      - every `go test` run, local and CI: a 3 s suite is at worst ~60 s under the 20x
+        ceiling — and a red on the introducing diff costs one diff-read, where the same red
+        surfacing later costs a bisect across every commit since;
+      - any suspicious repro on a dev box (`go run -race ./cmd/...`);
+      - never the production binary: the multiplier lands on every relayed packet, and prod
+        is the most expensive place to first learn about a race.
+
+      > [!KEY] Read `go test -race` green as "no race observed", never "race-free". This lesson's own grader obeys the same rule: 50 runs, verdict reported as probabilistic.
+
+worked_examples:
+  - id: go05b-w1
+    covers: [go05b-o1]
+    prompt: |
+      A conclave-shaped meter: goroutine A does `bytesUp += 1200` per relayed packet
+      (main.go:17, spawned at :13); goroutine B folds the meter into a stats line
+      (`sum += bytesUp`, main.go:25, spawned at :20). One real captured run printed
+      (exit status 66):
+
+      ```
+      WARNING: DATA RACE
+      Write at 0x00c00011c028 by goroutine 8:
+        main.main.func1()
+            meter/main.go:17 +0xc5
+
+      Previous read at 0x00c00011c028 by goroutine 9:
+        main.main.func2()
+            meter/main.go:25 +0xa9
+
+      Goroutine 8 (running) created at:
+        main.main()
+            meter/main.go:13 +0x168
+      ...
+      meter: 240000
+      Found 1 data race(s)
+      ```
+
+      State exactly what has been proven, what has NOT been shown (careful with
+      `meter: 240000`), and which lines you would act on.
+    solution: |
+      Proven: in THIS execution a write (func1, :17) and a read (func2, :25) hit the same
+      address 0x...028 with no happens-before edge between their vector clocks — a fact about
+      the run, not a suspicion. NOT shown: any corruption — `meter: 240000` is the correct
+      total (200 x 1200); a race proof does not need a wrong result, and a correct print never
+      acquits. Act on the four stacks: the two access sites name the shared word, the two
+      creation stacks name the `go` statements that own the contenders. The go05a call for a
+      single-word counter read concurrently is atomic.Int64. Exit status 66 is the bit CI
+      consumes — one race turns the whole run red.
+
+assessments:
+  - id: go05b-a1
+    type: predict_race_verdict
+    covers: [go05b-o1]
+    difficulty: easy
+    prompt: |
+      The meter, reduced to its bones: now BOTH goroutines are forwarders bumping one plain
+      int 200 times each, released together by a start barrier. Before answering, name the
+      conflicting access pair and state which happens-before edge, if any, orders them.
+      Then: the verdict over 50 instrumented runs?
+    grading:
+      strategy: deterministic_output
+      runner: "go build -race"
+      iterations: 50
+      expected_verdict: race
+      confidence: probabilistic
+      program: |
+        package main
+
+        import (
+        	"fmt"
+        	"sync"
+        )
+
+        func main() {
+        	meter := 0 // upload meter: plain int, two writers
+        	start := make(chan struct{})
+        	var wg sync.WaitGroup
+        	for g := 0; g < 2; g++ {
+        		wg.Add(1)
+        		go func() {
+        			defer wg.Done()
+        			<-start // barrier: both forwarders released together
+        			for i := 0; i < 200; i++ {
+        				meter++
+        			}
+        		}()
+        	}
+        	close(start)
+        	wg.Wait()
+        	fmt.Println("meter:", meter)
+        }
+
+  - id: go05b-a2
+    type: predict_race_verdict
+    covers: [go05b-o1]
+    difficulty: easy
+    prompt: |
+      One-line fix from go05a: the meter is now atomic.Int64; barrier and 200x contention
+      unchanged. Same question, 50 runs. Calibration before you answer: the harness reports
+      "clean" when 0 of 50 runs print WARNING: DATA RACE — that is "no race OBSERVED in 50
+      executions", a statement about those runs, never a proof about the program.
+    grading:
+      strategy: deterministic_output
+      runner: "go build -race"
+      iterations: 50
+      expected_verdict: clean
+      confidence: probabilistic
+      program: |
+        package main
+
+        import (
+        	"fmt"
+        	"sync"
+        	"sync/atomic"
+        )
+
+        func main() {
+        	var meter atomic.Int64 // same meter, the single-word primitive from go05a
+        	start := make(chan struct{})
+        	var wg sync.WaitGroup
+        	for g := 0; g < 2; g++ {
+        		wg.Add(1)
+        		go func() {
+        			defer wg.Done()
+        			<-start // same barrier, same 200x contention
+        			for i := 0; i < 200; i++ {
+        				meter.Add(1)
+        			}
+        		}()
+        	}
+        	close(start)
+        	wg.Wait()
+        	fmt.Println("meter:", meter.Load())
+        }
+
+  - id: go05b-a3
+    type: mcq
+    covers: [go05b-o2]
+    difficulty: medium
+    prompt: |
+      conclave's CI runs `go test -race ./...` on every push; the badge has been green for
+      three weeks. Precisely what does that green establish?
+    grading:
+      strategy: deterministic_choice
+      options:
+        - text: "The SFU code is race-free"
+          correct: false
+          why: "Green cannot speak about code it never watched: a race in the migration path contributes nothing while no test drives a migration. Three weeks of silence about unexercised paths is still silence."
+        - text: "No data race was observed on the interleavings and inputs those test runs exercised"
+          correct: true
+          why: "The detector's exact contract: vector clocks can only compare accesses that executed, under the sync edges of those particular runs. Green is absence of evidence; red is the proof."
+        - text: "Every execution of these tests satisfies the Go memory model"
+          correct: false
+          why: "-race checks one execution at a time. A run whose incidental channel edge ordered the pair stays green even though another schedule of the same code races; the universal claim needs reasoning over ALL interleavings (go05c), which no runtime checker does."
+        - text: "Races can no longer occur at runtime, since the tests exercise the instrumented binary"
+          correct: false
+          why: "Instrumentation adds checks, not synchronization — it creates no happens-before edges, so a racy program stays racy. And the binary you ship is built WITHOUT -race; the badge describes test binaries only."
+    reference_answer: "No data race was observed on the interleavings and inputs those test runs exercised"
+
+  - id: go05b-a4
+    type: mcq
+    covers: [go05b-o2]
+    difficulty: medium
+    prompt: |
+      conclave's full `go test ./...` suite finishes in about 3 s uninstrumented. The Go
+      race-detector docs put the cost at ~5-10x memory and ~2-20x CPU. Given both numbers,
+      where does -race belong in conclave's workflow?
+    grading:
+      strategy: deterministic_choice
+      options:
+        - text: "Every test run in CI plus any suspicious repro on a dev box"
+          correct: true
+          why: "A 3 s suite is at worst ~60 s under the 20x ceiling — cheap against a shipped race. Red on the introducing diff costs one diff-read; the same red found later costs a bisect across every commit since."
+        - text: "In the production server binary, so races are caught where they really happen"
+          correct: false
+          why: "The 5-10x memory / 2-20x CPU multiplier lands on every relayed packet — users pay the overhead, and a race caught there was already shipped. Prod runs the UNinstrumented build."
+        - text: "A nightly -race job only, keeping per-push CI fast"
+          correct: false
+          why: "Trades under a minute per push (on a seconds-scale suite) for a day of latency on a proof: a nightly report points at a day of merged commits, not the one diff that introduced the race."
+        - text: "Nowhere — a detector with false negatives is not worth 2-20x"
+          correct: false
+          why: "Backwards: false negatives weaken GREEN, but RED stays a zero-false-positive proof with paired stacks. Discarding proofs because silence is inconclusive throws away the strong half of the tool."
+    reference_answer: "Every test run in CI plus any suspicious repro on a dev box"
+
+limitations: >
+  Both race items are probabilistic by contract (R4): the measured rates on this box — 50/50
+  trips for the plain-int meter, 0/50 for the atomic one, 60/60 even for single unsynchronized
+  increments (go1.26.4, 20 CPUs) — are observations, and a different scheduler, load, or
+  GOMAXPROCS can shift them. A green a2 proves exactly "0 reports in 50 executions": -race
+  cannot see paths that never ran, interleavings never produced, or accesses evicted from its
+  bounded history. The 5-10x/2-20x figures are the Go docs' envelope, not a measurement of
+  conclave's suite, and the CI-placement answer is calibrated to a seconds-scale suite — a
+  30-minute suite under 20x CPU is a real budget decision this lesson does not make for you.
+  The formal memory model (which edges exist and why) is go05c's job.

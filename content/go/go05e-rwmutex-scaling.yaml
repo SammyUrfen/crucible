@@ -1,0 +1,465 @@
+# Pilot lesson 12 — authored per content/go/PILOT-CONVENTIONS.md; verify: make verify ID=go05e-rwmutex-scaling
+schema_version: 1
+id: go05e-rwmutex-scaling
+tag: go05e
+title: "Go: RWMutex — when readers scale, when they convoy"
+track: go
+week: "Track Go · Module 04/05 (pilot) · Lesson 12"
+priority: attack
+content_rev: 1
+toolchain: { go: "1.26" }
+prerequisites: [go05d-atomic-limits]
+altitude: ramp
+summary: >
+  go05d ended where a single atomic word stops being enough; the next stop is a lock, and Go
+  ships two flavors. You already own reader/writer locking from 2PL's shared vs exclusive
+  modes — what is new here is the PRICE LIST: every RLock/RUnlock still does an atomic RMW
+  on one shared reader-count word, a pending writer gates new readers, and so "readers
+  scale" is true only for the right read/write mix. This lesson makes you place RWMutex
+  correctly on conclave's peer registry — and reject it where a plain Mutex or an
+  atomic.Pointer snapshot is the honest answer.
+
+learning_objectives:
+  - { id: go05e-o1, bloom: create,   text: "Guard a shared map with sync.RWMutex — RLock for reads, Lock for every mutation, copies at the API boundary — proven under parallel access with -race" }
+  - { id: go05e-o2, bloom: evaluate, text: "Select RWMutex vs Mutex vs atomic.Pointer snapshot vs sharding from a stated read/write mix and defend the choice with contention mechanics" }
+  - { id: go05e-o3, bloom: analyze,  text: "Predict the -race verdict when a mutation sneaks into shared mode — RLock grants parallel entry, not exclusivity" }
+
+teach:
+  - heading: "parallel readers still share one word"
+    covers: [go05e-o2]
+    body: |
+      RLock is an atomic add on a single reader-count word inside the RWMutex; RUnlock
+      subtracts it back. Readers never block each other, but on N cores they all
+      read-modify-write the SAME cache line — each cross-core bounce costs ~40–100 ns,
+      while the map read you are guarding costs ~20–50 ns. Hammer RLock hard enough and
+      the lock word is hotter than the data.
+
+      The writer side sets the other trap. Lock waits for every in-flight reader to
+      drain, AND a pending writer gates new RLock calls (that is Go's anti-starvation
+      rule). Chain it: one slow reader holds up the writer, and the pending writer holds
+      up every NEW reader — a single join can stall a 40-peer forwarding path behind the
+      drain of in-flight lookups.
+
+      > [!KEY] RWMutex buys parallel read SECTIONS, not free reads — the reader-count word stays contended, and a pending writer blocks new readers.
+  - heading: "the decision is a ratio, not a taste"
+    covers: [go05e-o2]
+    body: |
+      Work the read/write mix before picking:
+
+      - **Read-mostly** (conclave's registry: ~8,000 lookups/s vs ~1 join/leave per
+        second — 8000:1): RWMutex is the idiomatic default. If a profile shows the RLock
+        word itself hot, step up to an atomic.Pointer[map[string]PeerInfo] snapshot —
+        readers pay ONE atomic pointer load (no shared write on the read path at all),
+        writers copy-on-write the whole map (40 entries ≈ single-digit µs, free at 1/s).
+      - **Write-heavy** (~90% of ops mutate): everything serializes on the writer
+        anyway. Plain Mutex has the cheaper acquire (one CAS, no reader accounting) and
+        routinely beats RWMutex in benchmarks once writes pass even ~10% of ops.
+      - **Measured hot mixed fan-in** (a single lock saturated at high core count):
+        shard — 16 locks over 16 sub-maps cuts per-lock contention ~16×, paid for with
+        the loss of a cheap consistent whole-map view.
+
+      (sync.Map exists for two niche shapes — append-mostly caches and goroutines with
+      disjoint key sets; the Go docs themselves say to start with a plain lock.)
+
+      > [!KEY] Read-mostly → RWMutex or snapshot; write-heavy → plain Mutex; a MEASURED single-lock ceiling → shard.
+  - heading: "RLock is not a write license"
+    covers: [go05e-o1, go05e-o3]
+    body: |
+      Placement discipline for a guarded map: every pure read — including the comma-ok
+      miss path — takes RLock/defer RUnlock; every mutation — insert, delete, even a
+      "harmless" counter bump — takes Lock/defer Unlock. Shared mode grants no
+      exclusivity: two goroutines holding RLock run truly in parallel, so a write under
+      RLock is a data race, and -race will name both RLock-holding goroutines.
+
+      Two Go-specific edges with sharp corners:
+
+      - **No upgrade, no recursion.** Lock while holding RLock deadlocks (RWMutex is
+        neither reentrant nor upgradeable), and a recursive RLock can deadlock too once
+        a writer is pending between the two acquisitions. The pattern is RUnlock, Lock,
+        re-check the condition.
+      - **The API boundary is where aliasing dies.** An accessor that returns the
+        internal map hands the caller an unsynchronized alias of your guarded state —
+        every later access bypasses the lock. Copy under RLock; return the copy.
+
+      > [!KEY] RLock for every pure read, Lock for ANY mutation, copy before you return a map.
+
+worked_examples:
+  - id: go05e-w1
+    covers: [go05e-o2]
+    prompt: |
+      Three conclave-adjacent workloads. Pick Mutex / RWMutex / atomic.Pointer snapshot /
+      sharding for each, from the mix alone:
+      (a) per-packet route lookup: ~8,000 reads/s, ~1 write/s (join/leave);
+      (b) per-packet stats sink: ~90% of operations write a counter, ~1 read/s;
+      (c) 64-core ingest hashing into one hot map, ~5M mixed ops/s, with a MEASURED
+      single-lock saturation.
+    solution: |
+      (a) Read-mostly at ~8000:1 — RWMutex is the default; if the profile shows the
+      RLock word itself hot, atomic.Pointer snapshot (reads become one atomic load;
+      writes copy 40 entries once per second ≈ free).
+      (b) Writers dominate, so every flavor serializes — plain Mutex wins on the cheaper
+      acquire (one CAS vs reader accounting plus the pending-writer gate) and simpler code.
+      (c) The measured single-lock ceiling is the one case that EARNS sharding: 16 shards
+      ≈ 1/16th contention per lock, paid for with the loss of a cheap consistent
+      whole-map view.
+
+assessments:
+  - id: go05e-a1
+    type: mcq
+    covers: [go05e-o2]
+    difficulty: medium
+    prompt: |
+      conclave's upload meter feeds a per-peer stats map: ~90% of operations WRITE
+      (every forwarded packet bumps a counter under the guard), and a dashboard reads
+      the whole map about once per second. The idiomatic guard is...
+    grading:
+      strategy: deterministic_choice
+      options:
+        - text: "sync.RWMutex — readers should never block each other"
+          correct: false
+          why: "There is almost nothing to parallelize: 90% of ops need the exclusive lock, so the workload serializes behind writers regardless of flavor — and RWMutex has the MORE expensive acquire (reader accounting plus the pending-writer gate) on every one of those dominant writes."
+        - text: "sync.Mutex"
+          correct: true
+          why: "When writers dominate, every flavor serializes; plain Mutex just has the cheapest acquire/release (a single atomic RMW each way — CAS in, add out — no reader accounting), so it is both the faster and the simpler guard — measure before adding anything fancier."
+        - text: "atomic.Pointer snapshot (copy-on-write map)"
+          correct: false
+          why: "Copy-on-write charges O(map) per WRITE to make reads free — exactly backwards at 90% writes: you would copy the whole map thousands of times per second and drown in allocation and GC, to speed up one read per second."
+        - text: "Shard the map across 16 mutexes by peer-id hash"
+          correct: false
+          why: "Sharding is the escalation AFTER a measured single-lock bottleneck on a hot mixed workload; jumping there first buys 16× the complexity for contention nobody demonstrated — and the 1/s dashboard read now needs 16 lock acquisitions for a consistent view."
+    reference_answer: "sync.Mutex"
+
+  - id: go05e-a2
+    type: predict_race_verdict
+    covers: [go05e-o3]
+    difficulty: medium
+    prompt: |
+      The author reasoned: "hits is just a counter, and RLock is cheaper than Lock."
+      Four goroutines run the loop below in parallel. Will -race report a DATA RACE?
+      (The harness compiles once and runs it 50×.)
+    grading:
+      strategy: deterministic_output
+      runner: "go build -race"
+      iterations: 50
+      confidence: probabilistic
+      expected_verdict: race
+      program: |
+        package main
+
+        import (
+        	"fmt"
+        	"sync"
+        )
+
+        // A read-mostly route cache -- with its hit counter bumped under RLock,
+        // because "it's only a counter".
+        type routeCache struct {
+        	mu   sync.RWMutex
+        	dest map[string]string
+        	hits int
+        }
+
+        func main() {
+        	c := &routeCache{dest: map[string]string{"peer-7": "10.0.0.7:5000"}}
+        	start := make(chan struct{})
+        	var wg sync.WaitGroup
+        	for g := 0; g < 4; g++ {
+        		wg.Add(1)
+        		go func() {
+        			defer wg.Done()
+        			<-start
+        			for i := 0; i < 100; i++ {
+        				c.mu.RLock()
+        				_ = c.dest["peer-7"]
+        				c.hits++ // a write, performed in shared mode
+        				c.mu.RUnlock()
+        			}
+        		}()
+        	}
+        	close(start)
+        	wg.Wait()
+        	fmt.Println("hits:", c.hits)
+        }
+
+  - id: go05e-a3
+    type: code_completion
+    covers: [go05e-o1]
+    difficulty: medium
+    prompt: |
+      conclave's SFU needs its peer registry safe under parallel access: Lookup on every
+      forwarded packet, Join/Leave on membership churn. The starter compiles and is
+      single-threaded-correct; with concurrent callers it is a data race. Add one
+      sync.RWMutex and take the right lock flavor in each method. The doc comments are
+      the contract, and the hidden tests hold you to ALL of it. Keep every signature.
+    grading:
+      strategy: hidden_tests
+      language: go
+      starter: |
+        package crucible
+
+        // PeerInfo is what the SFU needs on every forwarded packet: where to send it,
+        // and how the link is doing.
+        type PeerInfo struct {
+        	Addr    string
+        	Quality int
+        }
+
+        // PeerRegistry maps peer id -> PeerInfo. Lookup runs on EVERY forwarded packet
+        // (thousands/s); Join/Leave only on membership churn (~1/s).
+        //
+        // As written it has NO synchronization: concurrent use is a data race.
+        // Add a sync.RWMutex and take the right lock flavor in each method.
+        type PeerRegistry struct {
+        	peers map[string]PeerInfo
+        }
+
+        // NewPeerRegistry returns an empty registry ready for concurrent use.
+        func NewPeerRegistry() *PeerRegistry {
+        	return &PeerRegistry{peers: make(map[string]PeerInfo)}
+        }
+
+        // Lookup returns the info for id and whether it is a current member.
+        // Hot path: called per packet, in parallel, by every forwarding goroutine.
+        func (r *PeerRegistry) Lookup(id string) (PeerInfo, bool) {
+        	info, ok := r.peers[id]
+        	return info, ok
+        }
+
+        // Join adds or replaces a member.
+        func (r *PeerRegistry) Join(id string, info PeerInfo) {
+        	r.peers[id] = info
+        }
+
+        // Leave removes a member.
+        func (r *PeerRegistry) Leave(id string) {
+        	delete(r.peers, id)
+        }
+
+        // Snapshot returns the current membership for the election arbiter. The caller
+        // may range over, hold, and mutate the result without any registry lock.
+        func (r *PeerRegistry) Snapshot() map[string]PeerInfo {
+        	return r.peers
+        }
+      reference_solution: |
+        package crucible
+
+        import "sync"
+
+        // PeerInfo is what the SFU needs on every forwarded packet: where to send it,
+        // and how the link is doing.
+        type PeerInfo struct {
+        	Addr    string
+        	Quality int
+        }
+
+        // PeerRegistry maps peer id -> PeerInfo, guarded for a read-mostly mix:
+        // Lookup takes the shared lock, membership churn takes the exclusive one.
+        type PeerRegistry struct {
+        	mu    sync.RWMutex
+        	peers map[string]PeerInfo
+        }
+
+        // NewPeerRegistry returns an empty registry ready for concurrent use.
+        func NewPeerRegistry() *PeerRegistry {
+        	return &PeerRegistry{peers: make(map[string]PeerInfo)}
+        }
+
+        // Lookup returns the info for id and whether it is a current member.
+        // Pure read (the comma-ok miss path included): RLock.
+        func (r *PeerRegistry) Lookup(id string) (PeerInfo, bool) {
+        	r.mu.RLock()
+        	defer r.mu.RUnlock()
+        	info, ok := r.peers[id]
+        	return info, ok
+        }
+
+        // Join adds or replaces a member. Mutation: exclusive Lock.
+        func (r *PeerRegistry) Join(id string, info PeerInfo) {
+        	r.mu.Lock()
+        	defer r.mu.Unlock()
+        	r.peers[id] = info
+        }
+
+        // Leave removes a member. Mutation: exclusive Lock.
+        func (r *PeerRegistry) Leave(id string) {
+        	r.mu.Lock()
+        	defer r.mu.Unlock()
+        	delete(r.peers, id)
+        }
+
+        // Snapshot returns the current membership for the election arbiter. The caller
+        // may range over, hold, and mutate the result without any registry lock —
+        // so the alias must die here: copy under RLock, return the copy.
+        func (r *PeerRegistry) Snapshot() map[string]PeerInfo {
+        	r.mu.RLock()
+        	defer r.mu.RUnlock()
+        	out := make(map[string]PeerInfo, len(r.peers))
+        	for id, info := range r.peers {
+        		out[id] = info
+        	}
+        	return out
+        }
+      test_code: |
+        package crucible
+
+        import (
+        	"fmt"
+        	"sync"
+        	"testing"
+        )
+
+        // Visible: 8 readers hammer Lookup while 2 writers churn membership, all
+        // released by one start barrier. The -race flag is the real assertion; the
+        // seed checks catch lost updates.
+        func TestConcurrentReadsAndWrites(t *testing.T) {
+        	r := NewPeerRegistry()
+        	for i := 0; i < 8; i++ {
+        		r.Join(fmt.Sprintf("seed-%d", i), PeerInfo{Addr: "10.0.0.1:5000", Quality: i})
+        	}
+        	start := make(chan struct{})
+        	var wg sync.WaitGroup
+        	for g := 0; g < 8; g++ {
+        		wg.Add(1)
+        		go func(g int) {
+        			defer wg.Done()
+        			<-start
+        			id := fmt.Sprintf("seed-%d", g)
+        			for i := 0; i < 200; i++ {
+        				if _, ok := r.Lookup(id); !ok {
+        					t.Errorf("Lookup(%q): seed peer vanished (writers never remove seeds)", id)
+        					return
+        				}
+        			}
+        		}(g)
+        	}
+        	for w := 0; w < 2; w++ {
+        		wg.Add(1)
+        		go func(w int) {
+        			defer wg.Done()
+        			<-start
+        			id := fmt.Sprintf("churn-%d", w)
+        			for i := 0; i < 100; i++ {
+        				r.Join(id, PeerInfo{Addr: "10.0.0.9:5000", Quality: i})
+        				r.Leave(id)
+        			}
+        		}(w)
+        	}
+        	close(start)
+        	wg.Wait()
+        	for i := 0; i < 8; i++ {
+        		id := fmt.Sprintf("seed-%d", i)
+        		if info, ok := r.Lookup(id); !ok || info.Quality != i {
+        			t.Fatalf("after churn Lookup(%q) = %+v, %v; want Quality=%d, true", id, info, ok, i)
+        		}
+        	}
+        }
+
+        // Hidden: the snapshot must be a LOCKED COPY — never an alias of the internal
+        // map, and never an unlocked read of it. One goroutine repeatedly snapshots and
+        // mutates its snapshot while another churns the registry: an aliased map
+        // corrupts the live registry (and races); an unlocked copy races with the
+        // writer during the copy itself; a locked copy shrugs.
+        func TestSnapshotIsolation(t *testing.T) {
+        	r := NewPeerRegistry()
+        	r.Join("stable", PeerInfo{Addr: "10.0.0.1:5000", Quality: 3})
+        	start := make(chan struct{})
+        	var wg sync.WaitGroup
+        	wg.Add(2)
+        	go func() {
+        		defer wg.Done()
+        		<-start
+        		for i := 0; i < 100; i++ {
+        			snap := r.Snapshot()
+        			snap["scratch"] = PeerInfo{Quality: i}
+        			delete(snap, "stable")
+        		}
+        	}()
+        	go func() {
+        		defer wg.Done()
+        		<-start
+        		for i := 0; i < 100; i++ {
+        			r.Join("churn", PeerInfo{Quality: i})
+        			r.Leave("churn")
+        		}
+        	}()
+        	close(start)
+        	wg.Wait()
+        	if _, ok := r.Lookup("stable"); !ok {
+        		t.Fatal("deleting from the snapshot removed a live peer: Snapshot returned the internal map")
+        	}
+        	if _, ok := r.Lookup("scratch"); ok {
+        		t.Fatal("writing to the snapshot inserted a live peer: Snapshot returned the internal map")
+        	}
+        }
+
+        // Hidden: the miss path is part of the read contract.
+        func TestLookupMissingPeer(t *testing.T) {
+        	r := NewPeerRegistry()
+        	r.Join("present", PeerInfo{Addr: "10.0.0.2:5000", Quality: 1})
+        	info, ok := r.Lookup("absent")
+        	if ok {
+        		t.Fatal("Lookup(absent) reported ok=true")
+        	}
+        	if info != (PeerInfo{}) {
+        		t.Fatalf("Lookup(absent) = %+v; want the zero PeerInfo", info)
+        	}
+        }
+      tests:
+        - { name: TestConcurrentReadsAndWrites, visible: true,  golden: "8 readers + 2 writers behind a start barrier: -race clean, no seed peer lost" }
+        - { name: TestSnapshotIsolation,        visible: false, golden: "snapshotting (and mutating the result) while a writer churns must neither corrupt nor race the live registry — aliased AND unlocked copies both fail" }
+        - { name: TestLookupMissingPeer,        visible: false, golden: "Lookup of an absent id returns the zero PeerInfo and ok=false" }
+      race: true
+      timeout_ms: 10000
+
+  - id: go05e-a4
+    type: explain_tradeoff
+    covers: [go05e-o2]
+    difficulty: hard
+    prompt: |
+      In writing: conclave's peer registry at 40 peers — Lookup on every forwarded
+      packet (~8,000/s across the room), Join/Leave at ~1/s. Two defensible guards:
+      sync.RWMutex, or an atomic.Pointer copy-on-write snapshot. Name BOTH, commit to
+      one, defend it with the contention mechanics, state a concrete failure mode of
+      the one you reject, and include at least one number (the reads-per-write ratio
+      is a good start).
+    grading:
+      strategy: llm_judge
+      judge_mode: rubric
+      rubric:
+        pass_threshold: 0.6
+        criteria:
+          - { id: c1, weight: 0.35, text: "Names both candidates (RWMutex and atomic.Pointer snapshot) and commits to exactly one — either choice is acceptable; hedging is not" }
+          - { id: c2, weight: 0.35, text: "States a concrete failure mode of the REJECTED option (reader-count cache-line ping-pong / pending-writer read stall for RWMutex; per-write full-map copy or stale-snapshot window for the pointer swap)" }
+          - { id: c3, weight: 0.3,  text: "Includes a quantified claim (reads-per-write ratio, RLock = ~2 atomic RMWs, copy cost per write, ns/op)" }
+        anti_reward_hacking: { min_words: 40, penalize_if_contains: ["as an AI", "it depends"] }
+    reference_answer: |
+      Candidates: sync.RWMutex vs an atomic.Pointer[map[string]PeerInfo] copy-on-write
+      snapshot. The mix is ~8,000 Lookups/s against ~1 write/s — roughly 8000:1,
+      firmly read-mostly. I commit to the atomic.Pointer snapshot: a Lookup is one
+      atomic pointer load plus a plain map read — the read path WRITES no shared word
+      at all, so it stays flat as cores and peers grow; a Join copies 40 entries
+      (single-digit microseconds) and swaps the pointer, and at 1/s that cost is noise.
+      Rejected: RWMutex, whose failure mode at exactly this shape sits on the hot path —
+      every RLock/RUnlock is ~2 atomic RMWs on ONE shared reader-count word, so the
+      forwarding goroutines ping-pong that cache line (~40–100 ns per bounce, on reads
+      that cost ~20 ns), and a pending writer gates NEW readers, so a single join stalls
+      packet forwarding behind the drain of every in-flight lookup. The honest caveat:
+      at only 8,000 reads/s an RWMutex is nowhere near saturation and is the simpler
+      code — it is defensible today. The snapshot is the choice that REMOVES read-path
+      contention instead of managing it, and its own cost (a reader can briefly hold a
+      pre-Leave view of the room) is harmless to packet forwarding.
+
+limitations: >
+  TestConcurrentReadsAndWrites runs 10 goroutines for ~2,000 operations on one box — a
+  green -race run is a probabilistic absence of observed races (R4), not a proof, and it
+  says nothing about PERFORMANCE: this lesson's scaling claims (reader-count ping-pong,
+  Mutex beating RWMutex once writes pass ~10%) are mechanism arguments that only a
+  `go test -bench` + `-cpu` sweep on your own hardware can confirm or refute. The tests
+  also cannot see lock FLAVOR: a solution that takes the exclusive Lock in Lookup and
+  Snapshot (or swaps in a plain Mutex) is safe, so it passes the whole battery — the
+  RLock-on-the-read-path half of o1 is enforced by -race only in the too-weak direction
+  (a write under RLock fails; a needlessly exclusive read does not). The MCQ and judge
+  items grade reasoning, not measurements. The snapshot pattern's stale-read window
+  (a reader briefly holding a pre-Leave view) is asserted, never tested, here — and
+  nothing in this lesson exercises lock UPGRADE deadlocks; the no-upgrade rule is taught
+  but not assessed.

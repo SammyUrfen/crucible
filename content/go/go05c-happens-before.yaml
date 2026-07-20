@@ -1,0 +1,294 @@
+# Pilot lesson 10 — authored per content/go/PILOT-CONVENTIONS.md; verify: make verify ID=go05c-happens-before
+schema_version: 1
+id: go05c-happens-before
+tag: go05c
+title: "Go: happens-before — channels and mutexes are fences, sleep is not"
+track: go
+week: "Track Go · Module 05 (pilot) · Lesson 10"
+priority: attack
+content_rev: 1
+toolchain: { go: "1.26" }
+prerequisites: [go05b-race-detector]
+altitude: ramp
+summary: >
+  You have shipped lock-free code against the JMM (LongAdder aggregation, atomic buffer
+  swaps), so this is a contract you already honor — respelled, and with the stakes named
+  precisely: a Go data race is UNDEFINED behavior, not merely "one of the two values". The compiler
+  may hoist a plain-bool flag read out of a spin loop, so "works on my x86 laptop" compiles
+  to an infinite loop in production. The working tool is a five-line catalogue of
+  happens-before edges — channel send, close, mutex Unlock, WaitGroup Done, sync/atomic —
+  plus the discipline that time.Sleep is on no list at any duration. The exam is a conclave
+  review: reject the patch that publishes SFU election results via a plain bool.
+
+learning_objectives:
+  - { id: go05c-o1, bloom: analyze,  text: "Identify an unsynchronized-flag busy-wait as a data race and predict the -race verdict, knowing why instrumentation both catches the race and masks the production hang" }
+  - { id: go05c-o2, bloom: analyze,  text: "Classify constructs by whether they create a happens-before edge (send, close, Unlock/Lock, Done/Wait, atomic Store/Load) versus those that never do (Sleep, Gosched)" }
+  - { id: go05c-o3, bloom: evaluate, text: "Reject a sleeping/spinning-flag publish in code review — even one that passes on x86 today — by naming the replacement edge, the undefined-behavior failure mode, and a number" }
+
+teach:
+  - heading: "a data race is UNDEFINED behavior, not 'one of the two values'"
+    covers: [go05c-o1]
+    body: |
+      You know what the race IS; here is what Go is allowed to DO with it. The memory model
+      grants the compiler a license: if no synchronizing operation can change a value a
+      loop reads, the read may be hoisted out of the loop. So
+
+      ```go
+      for !done { // done is a plain bool; nothing in the loop synchronizes
+      	runtime.Gosched()
+      }
+      ```
+
+      is licensed to compile as `if !done { for { runtime.Gosched() } }` — the flag is read
+      exactly once, then one core spins at 100% forever. (Whether today's gc build actually
+      hoists past the Gosched call is an optimization detail you may not rely on.) Your x86
+      intuition — stores drain, strong hardware ordering — does not transfer, because the
+      reordering happens in the compiler: the silicon never sees a second load to order.
+
+      "Undefined" here is calibrated, not C++-flavored anything-goes: ref/mem bounds a racy
+      read of one machine word to SOME value actually written (no out-of-thin-air values),
+      and permits an implementation to report the race and halt instead (-race builds do
+      exactly that). The hoist lives inside that bound — a stale value re-read forever WAS
+      written once. Anything wider than a word may TEAR: a string or interface header is
+      2 words (a slice 3), so a racy read can pair the old pointer with the new length —
+      ref/mem names the result "arbitrary memory corruption".
+
+      > [!KEY] A data race means UNDEFINED behavior — the compiler may assume the racy value never changes, and any multiword read may be torn. "Passes today" is an accident of optimization level, not a property of the program.
+
+      One tooling consequence, continuing go05b: a -race build inserts an instrumented load
+      on every iteration, which BOTH flags the pair AND defeats the hoist. So the flag-spin
+      demo terminates and reports under -race while the same source built plain may hang.
+      A -race run tells you about the instrumented binary, never the production one.
+  - heading: "the edge catalogue — five you may rely on, and the impostors"
+    covers: [go05c-o2]
+    body: |
+      The edges (Go memory model, formalized for atomics in the Go 1.19 revision):
+
+      - `ch <- v` happens-before the receive of `v` completing: every write the sender made
+        before the send is visible to the receiver after the receive.
+      - `close(ch)` happens-before any receive that returns zero-because-closed — close is
+        a broadcast AND a memory publish (go04a's owner-closes pattern is also
+        memory-model-correct for exactly this reason).
+      - `mu.Unlock()` happens-before the next `mu.Lock()` on the same mutex: the critical
+        section's writes travel with the lock to its next holder.
+      - The final `wg.Done()` happens-before `wg.Wait()` returning — the closer-goroutine
+        pattern rides this edge.
+      - sync/atomic: since Go 1.19 atomics are formalized as synchronizing operations
+        (sequentially consistent) — if a Load observes a Store, everything written before
+        the Store is visible after the Load. `atomic.Bool` is a legitimate publish flag.
+
+      Not on the list at any parameter value: `time.Sleep` (orders wall-clock, not memory),
+      `runtime.Gosched()`, "my goroutine started first", the print statement that "fixes"
+      it. A 10x sleep margin changes the odds of observing staleness, never the legality of
+      the compiler's assumption.
+
+      > [!KEY] To defend a cross-goroutine read, NAME the edge from the write to it. No nameable edge = data race, whatever the test suite says today.
+  - heading: "the reviewer's move: reject the flag, name the replacement"
+    covers: [go05c-o3]
+    body: |
+      The patch you will reject in a4, in miniature — conclave's election goroutine decides
+      the SFU, then publishes:
+
+      ```go
+      sfuAddr = winner // plain string
+      elected = true   // plain bool
+      ```
+
+      and every peer spins `for !elected { runtime.Gosched() }` before dialing `sfuAddr`.
+      It demos fine on the author's laptop. The verdict must be REJECT, with the
+      replacement named:
+
+      - Preferred: `close(electedCh)`. One close wakes all N waiting peers (broadcast
+        semantics), waiters BLOCK on the receive instead of burning a core each, and the
+        close edge publishes `sfuAddr` for free.
+      - If peers genuinely must poll: keep the flag but make it `atomic.Bool` — an
+        observed Store edges to the Load (~1 ns, zero allocation), publishing `sfuAddr`
+        with it.
+
+      A rejection that only says "data race" is half a review. The house bar: name the
+      replacement edge, the concrete failure mode of the original (hoisted read → a peer
+      spins forever at 100% of one core; a stale `sfuAddr` → dial the wrong host; or a
+      torn `sfuAddr` — a string is a 2-word header, so a racy read may pair the old
+      pointer with the new length: arbitrary memory corruption), and a number.
+
+worked_examples:
+  - id: go05c-w1
+    covers: [go05c-o1, go05c-o2]
+    prompt: |
+      The patch author counters: "The election completes in ~5 ms; I'll time.Sleep(50 ms)
+      before reading — a 10x margin." Classify the happens-before edges in (a) the Sleep
+      version, and (b) a version where both writes and both reads happen under one
+      sync.Mutex.
+    solution: |
+      (a) None. Sleep orders wall-clock time, not memory: no synchronizing operation
+      touches sfuAddr or elected, so both reads still race with both writes. The 10x margin
+      changes the probability of observing a stale value, not the legality of the compiler
+      assuming the values never change — and -race flags it regardless of the margin.
+      (b) Sound. The election goroutine's mu.Unlock() happens-before the peer's mu.Lock(),
+      so both writes are visible to the reader. The residual objection is design, not
+      correctness: polling under a mutex still burns cycles; the close(electedCh) broadcast
+      removes the poll entirely.
+
+assessments:
+  - id: go05c-a1
+    type: predict_race_verdict
+    covers: [go05c-o1]
+    difficulty: medium
+    prompt: |
+      The flag-spin patch, reduced to one runnable file. The spin is capped and the program
+      joins the publisher goroutine before exiting, so it always terminates. Will running
+      this under -race report a DATA RACE? Answer race or clean — then say which variable(s)
+      the report would name.
+    grading:
+      strategy: deterministic_output
+      runner: "go build -race"
+      iterations: 50
+      expected_verdict: race
+      confidence: probabilistic
+      program: |
+        package main
+
+        import (
+        	"fmt"
+        	"runtime"
+        )
+
+        // spinCap bounds the busy-wait so every run finishes well inside the grader's
+        // 10 s per-run cap: ~100k yields costs well under a second on this box.
+        const spinCap = 100000
+
+        var (
+        	data int  // payload
+        	done bool // completion flag
+        )
+
+        func main() {
+        	start := make(chan struct{})
+        	finished := make(chan struct{})
+        	go func() {
+        		// start gate: opened by main just before its spin loop begins
+        		<-start
+        		data = 42
+        		done = true
+        		close(finished)
+        	}()
+        	close(start)
+        	spins := 0
+        	for !done && spins < spinCap {
+        		spins++
+        		runtime.Gosched()
+        	}
+        	fmt.Println("data:", data)
+        	// join the publisher so every run exits cleanly before the grader's timeout
+        	<-finished
+        }
+
+  - id: go05c-a2
+    type: multi_select
+    covers: [go05c-o2]
+    difficulty: medium
+    prompt: |
+      Goroutine A writes a payload, then signals; goroutine B observes the signal, then
+      reads the payload. Select EVERY construct whose signal creates a happens-before edge
+      that makes A's payload write visible to B's read.
+    grading:
+      strategy: deterministic_choice
+      partial_credit: jaccard
+      options:
+        - text: "A: ch <- v — B: v := <-ch (same channel)"
+          correct: true
+          why: "A send happens-before the corresponding receive completes, so B sees every write A made before the send. This is the workhorse edge of channel-owned state."
+        - text: "A: mu.Unlock() — B: mu.Lock() (same sync.Mutex)"
+          correct: true
+          why: "The n-th Unlock happens-before the (n+1)-th Lock: the critical section's writes travel with the lock to its next holder."
+        - text: "A: wg.Done() — B: wg.Wait() returns (same sync.WaitGroup)"
+          correct: true
+          why: "Wait returns only after the final Done, and every write before a Done is visible after Wait — the edge the go04a closer-goroutine pattern rides."
+        - text: "A: flag.Store(true) — B: flag.Load() observes true (an atomic.Bool)"
+          correct: true
+          why: "Since Go 1.19 the memory model formalizes sync/atomic as synchronizing (sequentially consistent) operations: an observed Store edges to the Load, so an atomic flag legitimately publishes the payload."
+        - text: "A writes, then B does time.Sleep(100 * time.Millisecond) before reading"
+          correct: false
+          why: "Sleep orders wall-clock time, not memory — no edge exists at ANY duration, the compiler may still assume the value never changes, and -race still flags the pair. runtime.Gosched() is the same impostor in yield form."
+    reference_answer: "Every construct except the Sleep: send→receive, Unlock→Lock, Done→Wait, and atomic Store→observed Load all create happens-before edges; time.Sleep never does."
+
+  - id: go05c-a3
+    type: predict_output
+    covers: [go05c-o2]
+    difficulty: easy
+    prompt: |
+      The done-channel fix from teach 3, reduced. Predict the exact stdout (two lines) —
+      and before revealing, name the edge that makes the first line deterministic rather
+      than a coin flip.
+    grading:
+      strategy: deterministic_output
+      runner: "go run"
+      match: trimmed
+      program: |
+        package main
+
+        import "fmt"
+
+        func main() {
+        	data := 0
+        	done := make(chan struct{})
+        	go func() {
+        		data = 42
+        		close(done)
+        	}()
+        	<-done
+        	fmt.Println("data:", data)
+        	v, ok := <-done
+        	fmt.Println(v, ok)
+        }
+      expected_output: |
+        data: 42
+        {} false
+
+  - id: go05c-a4
+    type: explain_tradeoff
+    covers: [go05c-o3]
+    difficulty: hard
+    prompt: |
+      conclave code review, in writing. The patch publishes SFU election results as
+      `sfuAddr = winner; elected = true` (both plain), and each peer runs
+      `for !elected { runtime.Gosched() }` before dialing sfuAddr. The author notes it has
+      passed every demo on his x86 laptop. Write the rejection: name at least one concrete
+      replacement (and why its edge fixes the bug), the failure mode(s) of the flag-spin as
+      written, and include at least one number. "It's a data race" alone does not clear the bar.
+    grading:
+      strategy: llm_judge
+      judge_mode: rubric
+      rubric:
+        pass_threshold: 0.6
+        criteria:
+          - { id: c1, weight: 0.4, text: "Names a concrete replacement — close(electedCh) broadcast and/or atomic.Bool — AND the happens-before edge it introduces that publishes sfuAddr" }
+          - { id: c2, weight: 0.3, text: "States a concrete undefined-behavior failure mode: compiler hoists the flag load so the loop spins forever, and/or the peer reads a stale sfuAddr and dials the wrong host, and/or the 2-word string header tears (old pointer + new length)" }
+          - { id: c3, weight: 0.3, text: "Includes a quantified claim (e.g. flag read once then 100% of one core burned, N peers x 1 core each, ~1 ns per atomic Load, 0 allocations for close)" }
+        anti_reward_hacking: { min_words: 40, penalize_if_contains: ["as an AI", "it depends"] }
+    reference_answer: |
+      Reject: a plain bool carries no happens-before edge, so this loop is a data race and
+      its behavior is undefined — the compiler is entitled to hoist the flag load, meaning
+      each peer reads `elected` exactly once and then spins forever at 100% of one core
+      (N waiting peers = N burned cores); and even on an exit, nothing publishes `sfuAddr`,
+      so the peer can read a stale, zero-value, or torn address — a string is a 2-word
+      header, and an unsynchronized read may pair the old pointer with the new length,
+      which ref/mem calls arbitrary memory corruption. That it passes on an x86 laptop is
+      an accident of the current optimizer, not evidence. Replace with close(electedCh):
+      close happens-before every receive that observes it, so one close wakes all N peers
+      with `sfuAddr` guaranteed visible, waiters block at 0% CPU instead of polling, and it
+      costs zero allocations. If polling were truly required, atomic.Bool keeps the shape —
+      Go 1.19 formalized atomics as synchronizing, so an observed Store publishes sfuAddr,
+      at roughly 1 ns per Load. Note the tooling trap: -race flags this on the first run,
+      but its instrumented loads also defeat the hoist, so a -race binary can never
+      reproduce the production hang.
+
+limitations: >
+  a1 is probabilistic (R4): its ~50/50 trip count shows -race catches THIS construction, not
+  race-freedom of anything else — and because instrumentation defeats the hoist, the
+  production failure mode (flag read once, spin forever) is argued from the memory model
+  here, never reproduced by any run, green or red. The edge catalogue covers the five
+  constructs this track reaches for; it is not the full model (no unsafe.Pointer
+  publication, no Map/Pool/Once fine print, no fence-free ordering subtleties). a4 is
+  self-graded against the reference at LOW confidence until the hosted judge arrives
+  (Phase 4).

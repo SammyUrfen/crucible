@@ -1,0 +1,140 @@
+# content/go/go04-concurrency-discrimination.yaml
+# CANONICAL lesson schema + worked example (the Go vertical slice).
+# YAML is the source-of-truth; `make gate` compiles it -> build/*.json and validates.
+# This one file exercises all THREE grading strategies: deterministic_choice,
+# deterministic_output, hidden_tests, and llm_judge.
+#
+# NOTE (resolution R4): predict_race_verdict is NOT a clean deterministic oracle.
+# `go test -race` only reports interleavings it actually observes (false negatives),
+# so this item runs the snippet over MANY iterations and is reported as probabilistic.
+# See docs/04-grading.md and PLAN.md#R4.
+
+schema_version: 1
+id: go04-concurrency-discrimination        # kebab; MUST start with "<tag>-"; gate refuses unknown/newer schema_version
+tag: go04
+title: "Go: mutex vs channel vs atomic — discrimination & leak-free lifecycles"
+track: go
+week: "Track Go · Module 04"
+priority: attack                           # attack | moderate | review | meta
+content_rev: 1                             # bumped on ANY edit; git is the version store
+toolchain: { go: "1.22" }                  # per-track pin (R10 content-aging); gate runs against this
+prerequisites: [go02-interfaces, go03-errors-as-values]   # gate asserts these ids exist
+altitude: ramp                             # on_ramp | ramp — enforces per-language asymmetry (Go ramps; Python is deep from day 1)
+summary: >
+  Go gives you Mutex, channel, atomic, and errgroup for concurrency. The skill is not
+  "what is a race" (he owns that) — it is SELECTING the idiomatic primitive and proving
+  the choice under `go test -race`.
+
+learning_objectives:                       # each MUST be taught AND assessed via `covers`
+  - { id: go04-o1, bloom: evaluate, text: "Select Mutex/channel/atomic/errgroup for an unlabeled contention scenario and justify" }
+  - { id: go04-o2, bloom: create,   text: "Build a leak-free goroutine lifecycle under context cancellation, proven -race clean" }
+  - { id: go04-o3, bloom: analyze,  text: "Predict the -race verdict for a data-race snippet (probabilistic)" }
+
+teach:
+  - heading: "Three primitives, one decision"
+    covers: [go04-o1]
+    body: |
+      > [!KEY] Default: atomic for a counter, Mutex for a multi-word invariant, channel for ownership transfer.
+      errgroup when you need fan-out + first-error + cancellation.
+  - heading: "Who closes the channel; who cancels the context"
+    covers: [go04-o2, go04-o3]
+    body: |
+      The creator closes the channel. `context.WithTimeout` + `defer cancel()` or you leak the timer.
+
+worked_examples:
+  - id: go04-w1
+    covers: [go04-o1]
+    prompt: "A hot counter incremented by 8 goroutines, read rarely. Pick the primitive."
+    solution: |
+      atomic.Int64 — single-word, lock-free; a Mutex here is idiomatic-wrong (over-serializes the common path).
+
+assessments:                               # >=1 REQUIRED; union(assessments[].covers) == objective id set (coverage-closure)
+  # ---- MCQ (deterministic_choice) ----
+  - id: go04-a1
+    type: mcq
+    covers: [go04-o1]
+    difficulty: easy
+    prompt: "8 goroutines increment one int64 counter, read once/sec. The idiomatic primitive is..."
+    grading:
+      strategy: deterministic_choice
+      options:                             # gate requires exactly one correct:true and a non-empty `why` on EVERY option
+        - { text: "sync.Mutex",      correct: false, why: "over-serializes a single-word update; contention on the hot path" }
+        - { text: "atomic.Int64",    correct: true,  why: "single-word, lock-free, exactly the LongAdder mental model" }
+        - { text: "buffered channel", correct: false, why: "channel is for ownership transfer, not a shared counter" }
+        - { text: "errgroup",        correct: false, why: "that's fan-out + first-error, not counting" }
+    reference_answer: "atomic.Int64"
+
+  # ---- predict the -race verdict (deterministic_output; PROBABILISTIC per R4) ----
+  - id: go04-a2
+    type: predict_race_verdict
+    covers: [go04-o3]
+    grading:
+      strategy: deterministic_output
+      runner: "go test -race"
+      iterations: 50                       # R4: run many times; -race has false negatives on a single run
+      program: |
+        // two goroutines write the same map key with no sync — a reliably-tripping construction
+        m := map[string]int{}
+        var wg sync.WaitGroup; wg.Add(2)
+        go func(){ defer wg.Done(); m["x"]++ }()
+        go func(){ defer wg.Done(); m["x"]++ }()
+        wg.Wait()
+      expected_output: "DATA RACE"          # gate asserts >=1 of N iterations reports it; probabilistic, reported as such
+      match: contains
+      confidence: probabilistic
+
+  # ---- build-the-primitive (hidden_tests; v1 = plain local `go test`, see R3) ----
+  - id: go04-a3
+    type: code_from_scratch
+    covers: [go04-o2]
+    difficulty: hard
+    grading:
+      strategy: hidden_tests
+      language: go
+      starter: |
+        // Worker pool over jobs, graceful shutdown via ctx; must not leak goroutines.
+        func Run(ctx context.Context, jobs <-chan int, n int) (processed int) { /* TODO */ }
+      reference_solution: |                 # gate EXECUTES this vs ALL tests under -race; green or the lesson is REJECTED
+        func Run(ctx context.Context, jobs <-chan int, n int) (processed int) {
+            var wg sync.WaitGroup; var c atomic.Int64
+            for i := 0; i < n; i++ { wg.Add(1); go func(){ defer wg.Done()
+                for { select { case <-ctx.Done(): return
+                    case j, ok := <-jobs: if !ok { return }; _ = j; c.Add(1) } } }() }
+            wg.Wait(); return int(c.Load())
+        }
+      tests:                               # hidden tests injected at grade time from OUTSIDE the runner (R3)
+        - { name: drains_all, visible: true,  golden: "closes jobs, all processed" }
+        - { name: ctx_cancel, visible: false, golden: "returns promptly on cancel" }
+        - { name: no_leak,    visible: false, golden: "goleak: zero lingering goroutines" }
+      race: true
+      timeout_ms: 5000
+      llm_review: { enabled: true, weight_of_style: 0.0 }   # advisory ONLY; tests decide pass/fail (LLM never hard-fails)
+
+  # ---- explain-it-back (llm_judge; HOSTED judge per R1, reference-grounded) ----
+  - id: go04-a4
+    type: explain_tradeoff
+    covers: [go04-o1]
+    difficulty: hard
+    grading:
+      strategy: llm_judge
+      judge_mode: rubric
+      rubric:
+        pass_threshold: 0.6
+        criteria:
+          - { id: c1, weight: 0.4, text: "Names the rejected alternative (why NOT a channel here)" }
+          - { id: c2, weight: 0.3, text: "States a concrete failure mode of the wrong choice" }
+          - { id: c3, weight: 0.3, text: "Includes a quantified claim (contention/ns-per-op/allocs)" }
+        anti_reward_hacking: { min_words: 40, penalize_if_contains: ["as an AI", "it depends"] }
+    reference_answer: |                      # gate asserts this gold answer clears its OWN rubric before commit
+      Use atomic for the counter; a channel is rejected because ownership isn't transferring — you'd pay a
+      scheduler hop per increment (measurably higher ns/op under 8-way contention) and the failure mode of a
+      Mutex is convoy-ing readers behind writers. atomic.Int64 is ~1 CAS, no allocation.
+
+figures:
+  go04-fig-select:
+    caption: "Decision: single-word -> atomic; invariant -> Mutex; ownership -> channel; fan-out+error -> errgroup."
+    svg: "<svg viewBox=\"0 0 640 200\" role=\"img\">...</svg>"   # referential-integrity + no-hardcoded-colors rules (dsa-workbook lineage)
+
+limitations: >
+  A green -race run does NOT prove race-freedom (false negatives); goleak proves no leak only for the
+  interleavings exercised. This module teaches primitive SELECTION, not the Go memory model formally.

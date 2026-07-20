@@ -1,0 +1,221 @@
+# Pilot lesson 8 — authored per content/go/PILOT-CONVENTIONS.md; verify: make verify ID=go05a-primitive-discrimination
+schema_version: 1
+id: go05a-primitive-discrimination
+tag: go05a
+title: "Go: Mutex, channel, atomic, errgroup — pick one and defend it"
+track: go
+week: "Track Go · Module 05 (pilot) · Lesson 8"
+priority: attack
+content_rev: 1
+toolchain: { go: "1.26" }
+prerequisites: [go04f-worker-pool]
+altitude: ramp
+summary: >
+  You have made this call before — GOOGLY's LongAdder-style write path, conclave's lock-free
+  upload meter — but always inside a system where the answer was already forced. This lesson is
+  the namesake skill of the whole track: an UNLABELED contention scenario walks in and you
+  classify the sharing in one pass — single word, atomic; multi-word invariant, Mutex; ownership
+  handoff, channel; fan-out + first-error + cancel, errgroup-shape — then defend the pick with a
+  number, because "atomic is faster" is an adjective and ~5-10 ns vs ~15-25 ns is an argument.
+
+learning_objectives:
+  - { id: go05a-o1, bloom: evaluate, text: "Select the idiomatic primitive (atomic / Mutex / channel / errgroup-shape) for an unlabeled contention scenario and articulate the single discriminating feature" }
+  - { id: go05a-o2, bloom: evaluate, text: "Defend a primitive selection with a quantified cost claim, a named rejected alternative, and that alternative's concrete failure mode" }
+
+teach:
+  - heading: "Classify the sharing, not the data"
+    covers: [go05a-o1]
+    body: |
+      Every scenario in this half of the track yields to four questions, asked in order.
+      What is actually shared? If it is one machine word — a counter, a flag, a pointer to
+      an immutable blob — atomic covers it whole. If the truth spans words — two fields that
+      must change together, a map's internals across an iteration — nothing smaller than a
+      critical section works: Mutex. If the data is not shared at all but MOVING — produced
+      here, consumed exactly once over there — that is ownership transfer: channel. And if
+      you are coordinating control, not data — start N tasks, first error wins, cancel the
+      rest — that is the errgroup shape.
+
+      > [!KEY] Single word → atomic; multi-word invariant → Mutex; ownership handoff → channel; fan-out + first-error + cancel → errgroup-shape.
+
+      The subtlest row is "single word": a whole read-mostly Config is one word, because the
+      shared thing is the POINTER — provided the value behind it is immutable once published.
+
+      ```go
+      var cfg atomic.Pointer[Config] // readers: cfg.Load(); watcher: cfg.Store(next)
+      ```
+
+      Readers never block and never write shared memory (an RWMutex RLock still bumps a
+      shared reader counter — one cache-line write per read), and an in-flight reader keeps
+      the old snapshot, which stays valid precisely because nobody mutates a published Config.
+
+      Two footnotes with teeth. errgroup lives in golang.org/x/sync, not the stdlib — it is
+      the SHAPE you are recognizing; hand-rolled it is context.WithCancel + WaitGroup + a
+      sync.Once around the first error. And "share memory by communicating" is not a fifth
+      row: it restates the channel row, and over-applying it to genuinely shared state (a
+      config, a registry) is the classic Go-beginner over-rotation.
+  - heading: "A defense is a feature, a named rejection, and a number"
+    covers: [go05a-o2]
+    body: |
+      The house bar for "I picked X": the discriminating feature, the rejected alternative by
+      name with its concrete failure mode, and a number. The approximate cost ladder on a
+      typical modern x86 box — order-of-magnitude ranges, pin them with go test -bench and
+      b.RunParallel before quoting them anywhere that matters:
+
+      - atomic.Int64.Add: ~5-10 ns uncontended — one locked read-modify-write (LOCK XADD
+        on amd64; Add returns the new value, so it is XADD, not a plain ADD).
+      - sync.Mutex Lock+Unlock: ~15-25 ns uncontended (a CAS to lock, an atomic add to
+        unlock); once contended, losers park in the runtime and pay a wakeup — hundreds of
+        ns to a few μs and a scheduler visit.
+      - channel send+receive: ~60-200 ns per hop even when nobody blocks; a blocking
+        handoff parks a goroutine by design.
+
+      > [!KEY] Under contention the gap WIDENS: an atomic add stays one hardware-arbitrated instruction on the fought-over cache line; a mutex stacks parking and handoff on top of the same cache-line fight.
+
+      That is the whole quantified case for conclave's upload meter: a per-peer byte sum is a
+      single word with no invariant attached, so a Mutex buys zero correctness and sells your
+      hot path. You made that call informally when you built the mesh router's meter — this
+      lesson's exit bar is making it with the number attached.
+
+worked_examples:
+  - id: go05a-w1
+    covers: [go05a-o1, go05a-o2]
+    prompt: |
+      conclave's peer registry: a map[peerID]*Peer written by signaling goroutines on
+      join/leave, and a fan-out loop that ranges over every peer to broadcast an event.
+      Pick the primitive; name and reject the alternative.
+    solution: |
+      Mutex (RWMutex only if profiling shows broadcast reads dominate). The shared thing is
+      the map's multi-word internals PLUS each whole iteration, which must be one critical
+      section: an unlocked add during a range trips the runtime throw 'fatal error:
+      concurrent map iteration and map write' — and that detector is best-effort, so the
+      interleavings it misses are silent corruption, not safety. No atomic covers map
+      internals. Rejected by name:
+      the actor design — hand the map to one owner goroutine and send it commands over a
+      channel. Defensible, but every lookup becomes a ~100+ ns scheduler round-trip vs
+      ~15-25 ns uncontended Lock/Unlock. One trap worth writing down either way: do not
+      send to slow peers while holding the lock — copy the peer slice under the lock,
+      release, then send, or every join stalls behind the slowest consumer.
+
+assessments:
+  - id: go05a-a1
+    type: mcq
+    covers: [go05a-o1]
+    difficulty: medium
+    prompt: |
+      Config hot-reload in a long-running server: every request handler (8 goroutines)
+      reads the current *Config; a watcher goroutine replaces it wholesale when the file
+      changes. Reads outnumber replacements well over 1000:1, and a published Config is
+      never mutated in place. The idiomatic primitive is...
+    grading:
+      strategy: deterministic_choice
+      options:
+        - text: "sync.RWMutex around the *Config field"
+          correct: false
+          why: "The defensible-looking loser. Every RLock/RUnlock still writes the shared reader counter — 8 readers ping-ponging one cache line on every request — and a writer taking Lock stalls all new readers for the swap window. The pointer swap costs readers one atomic Load, they never block, and in-flight readers keep the old snapshot, which stays valid because a published Config is immutable."
+        - text: "atomic.Pointer[Config]: readers Load, the watcher Stores a fresh immutable Config"
+          correct: true
+          why: "The shared thing is a single word — the pointer. Readers never block and never write shared memory; the rare whole-struct replacement is one Store; the old Config survives for whoever already Loaded it. Immutable-once-published is what makes the single-word classification honest."
+        - text: "sync.Mutex around the Config's fields"
+          correct: false
+          why: "Serializes a 1000:1 read-dominated path (~15-25 ns Lock/Unlock per read, plus contention), and mutating fields in place under the lock destroys the snapshot property the readers rely on — a handler would have to hold the lock across its whole request to see a coherent config."
+        - text: "a chan *Config the watcher sends each new config on"
+          correct: false
+          why: "A channel transfers ownership to ONE receiver: a sent config is consumed by whichever handler happens to receive it and the other 7 goroutines never see it. Config is shared state that everyone reads, not a value being handed off — the wrong row of the table entirely."
+    reference_answer: "atomic.Pointer[Config]: readers Load, the watcher Stores a fresh immutable Config"
+
+  - id: go05a-a2
+    type: mcq
+    covers: [go05a-o1]
+    difficulty: easy
+    prompt: |
+      conclave's data path: the decoder goroutine produces a parsed media frame; the
+      forwarder goroutine must consume each frame exactly once, in order, and the decoder
+      never touches a frame after handing it over. The idiomatic primitive is...
+    grading:
+      strategy: deterministic_choice
+      options:
+        - text: "a chan *Frame from the decoder to the forwarder"
+          correct: true
+          why: "Exactly-once, in-order handoff is what a channel says by construction — and the send's happens-before edge means the forwarder reads the frame's fields with no lock at all. Ownership transfer is the channel row, verbatim."
+        - text: "a Mutex-guarded []*Frame shared queue"
+          correct: false
+          why: "You would be hand-rolling the channel: the Mutex protects the slice but gives no way to WAIT for a frame, so you bolt on sync.Cond or busy-poll, then re-invent close semantics for shutdown. Same machine underneath, more code, zero new capability."
+        - text: "atomic.Pointer[Frame] the decoder Stores into"
+          correct: false
+          why: "A pointer cell holds the LATEST value, not a queue: two Stores before one Load and the earlier frame is silently dropped. Atomic swap is the share-latest shape (the config scenario) — never exactly-once delivery."
+        - text: "errgroup, with decoder and forwarder as g.Go tasks"
+          correct: false
+          why: "errgroup answers 'run these, first error wins, cancel the siblings' — a control-plane shape. It moves no data; you would still need the channel between the two tasks, so it cannot be THE primitive for the handoff."
+    reference_answer: "a chan *Frame from the decoder to the forwarder"
+
+  - id: go05a-a3
+    type: multi_select
+    covers: [go05a-o1]
+    difficulty: medium
+    prompt: |
+      Which TWO of these four scenarios genuinely need a Mutex? Scoring is both-or-nothing:
+      the exact set or zero.
+    grading:
+      strategy: deterministic_choice
+      partial_credit: all # any value other than "jaccard" = set equality (both-or-nothing)
+      options:
+        - text: "Per-session state where state SessionState and lastSeq uint64 must change together — a reader must never see the new state with the old seq"
+          correct: true
+          why: "A cross-field invariant spans two words, and no single atomic operation covers both. Holding one Mutex across both writes AND both reads is the smallest thing that makes the pair atomic; two separate atomics reintroduces the torn read."
+        - text: "One goroutine ranges over a shared map[peerID]*Peer while signaling goroutines add and remove peers in place"
+          correct: true
+          why: "Map internals are multi-word and an iteration is many steps — an unlocked concurrent write trips the runtime throw 'concurrent map iteration and map write' (best-effort detection; a missed catch is silent corruption). The whole range must be one critical section, and no atomic protects a live map's internals. The lock-free escape is copy-on-write — an immutable map behind atomic.Pointer, cloned per write — but that is a redesign that pays a full clone per join/leave, not a primitive swap for this in-place map."
+        - text: "A lone int64 totaling bytes forwarded, bumped by every sender goroutine"
+          correct: false
+          why: "Single word, no invariant tying it to anything else: atomic.Int64.Add. A Mutex here serializes the hot path for nothing — ~15-25 ns plus contention parking, against ~5-10 ns for the locked add (LOCK XADD)."
+        - text: "Workers must learn that shutdown has begun so they can drain and exit"
+          correct: false
+          why: "A broadcast completion signal: close(done) or a cancelled Context unblocks every waiter at once, with a happens-before edge. A Mutex-guarded bool is polling — workers blocked in a select never re-check it, so the signal is missed exactly when it matters."
+    reference_answer: "The session-state pair (cross-field invariant) and the map iterated under mutation — the counter is atomic's row, the shutdown signal is a closed channel's."
+
+  - id: go05a-a4
+    type: explain_tradeoff
+    covers: [go05a-o2]
+    difficulty: hard
+    prompt: |
+      conclave's upload meter, in writing this time. Every forwarded packet adds its byte
+      count to a per-peer total; 8 sender goroutines bump it on the hot path; a metrics
+      goroutine reads it once per second. You chose atomic.Int64 informally when you built
+      the mesh router — now defend it against the rejected alternative, a Mutex-guarded
+      int64. Name the property of the scenario that makes atomic sufficient, the Mutex's
+      concrete failure mode on this path, and an approximate cost number for the gap.
+    grading:
+      strategy: llm_judge
+      judge_mode: rubric
+      rubric:
+        pass_threshold: 0.6
+        criteria:
+          - { id: c1, weight: 0.4, text: "Names the discriminating feature — a single-word sum with no cross-field invariant to protect — and rejects the Mutex-guarded int64 by name (naming a second rejected shape, e.g. a channel to a counter goroutine, strengthens)" }
+          - { id: c2, weight: 0.3, text: "States the Mutex's concrete failure mode here: 8 senders serialize on the per-packet hot path, contended losers park in the runtime and pay a wakeup, for zero correctness gained over the atomic" }
+          - { id: c3, weight: 0.3, text: "Includes an approximate cost number: uncontended Lock+Unlock ~15-25 ns vs ~5-10 ns for the single locked add (LOCK XADD), and notes the gap WIDENS under 8-way contention" }
+        anti_reward_hacking: { min_words: 40, penalize_if_contains: ["as an AI", "it depends"] }
+    reference_answer: |
+      The meter is a single machine word — a running byte sum with no invariant tying it to
+      any other field — so the classification question "what must change together?" answers
+      "one word, alone": atomic.Int64. The rejected Mutex-guarded int64 buys zero
+      correctness and puts a lock on the per-packet hot path: 8 senders serialize, and every
+      loser of the fast-path CAS parks in the runtime and pays a wakeup on top. Uncontended,
+      Lock+Unlock costs roughly 15-25 ns against ~5-10 ns for the single locked add (LOCK
+      XADD) the atomic add compiles to, and under 8-way contention the gap widens — both
+      fight for the same
+      cache line, but the mutex stacks parking and handoff onto that fight while the atomic
+      stays one hardware-arbitrated instruction. Also rejected: a channel feeding a counter
+      goroutine — a ~100+ ns scheduler hop per packet to move one integer. These are
+      order-of-magnitude x86 figures; go test -bench with b.RunParallel is how you pin them
+      on this box.
+
+limitations: >
+  Every cost figure in this lesson is an order-of-magnitude range for a typical x86 box, not a
+  measurement from this machine — quoting them beyond this lesson without running go test
+  -bench (b.RunParallel) yourself is exactly the adjectives-over-numbers failure the track
+  bans. The MCQs prove discrimination only on PINNED scenarios (read/write ratio and
+  immutability stated up front); real scenarios arrive vague, where two primitives stay
+  defensible until you pin those facts, and asking the pinning question is practiced only in
+  the judge item. Nothing here executes: a green run proves selection and defense, not that
+  you can implement the chosen primitive correctly (go04's build items carry that), and the
+  judge item is self-graded against the reference at LOW confidence in Phase 0.

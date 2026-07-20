@@ -1,0 +1,276 @@
+# Pilot lesson 2 — authored per content/go/PILOT-CONVENTIONS.md; verify: make verify ID=go04b-buffered-or-rendezvous
+schema_version: 1
+id: go04b-buffered-or-rendezvous
+tag: go04b
+title: "Go: unbuffered vs buffered — rendezvous, mailbox, and the deadlock in between"
+track: go
+week: "Track Go · Module 04 (pilot) · Lesson 2"
+priority: attack
+content_rev: 1
+toolchain: { go: "1.26" }
+prerequisites: [go04a-channel-ownership]
+altitude: on_ramp
+summary: >
+  make(chan T) versus make(chan T, N) is one integer, and it changes what "send" means. You
+  have built this trade-off by hand — a bounded queue between producer and consumer, and the
+  decision of what happens when it fills (GOOGLY's batch-write buffer swap). Go compresses it:
+  cap 0 is a rendezvous where send and receive complete together; cap N is a mailbox that
+  decouples them and quietly removes your backpressure. The skill here is predicting exactly
+  what blocks when, reading the runtime's one loud failure ("fatal error: all goroutines are
+  asleep - deadlock!"), and choosing capacity as a correctness decision — 0, 1, or
+  N-with-a-policy — never a knob turned until a warning goes away. That knob-turn is how
+  conclave's done-signal channel dies quietly at burst 65.
+
+learning_objectives:
+  - { id: go04b-o1, bloom: analyze,  text: "Predict which channel operation blocks — and whether the runtime deadlock detector fires — for cap-0 and cap-N sends and receives, down to the exact fatal error text" }
+  - { id: go04b-o2, bloom: evaluate, text: "Choose a channel capacity for a scenario and defend it: 0 for rendezvous/handshake, 1 for a single-shot mailbox or latest-value slot, N only with a named overflow policy and burst bound" }
+  - { id: go04b-o3, bloom: evaluate, text: "Judge whether adding buffer capacity repairs a blocking bug or merely reschedules it, and name the evidence that separates the two" }
+
+teach:
+  - heading: "cap 0 is a rendezvous; cap N is a mailbox"
+    covers: [go04b-o1]
+    body: |
+      Three rules decide every prediction. (1) cap 0: send AND receive each block until the
+      other side is at the channel — the pair completes together, as one synchronization
+      event. (2) Buffered send blocks only when `len == cap`. (3) Buffered receive blocks
+      only when `len == 0`. The asymmetry to internalize: an unbuffered channel has no slots
+      at all — `len == cap == 0` forever — so rules 2 and 3 never apply to it; NEITHER of
+      its operations can complete against a buffer, only WITH a partner (a receive completes
+      instantly against a parked sender even though len reads 0). That pairing is also the
+      happens-before edge you get for free.
+
+      > [!KEY] cap 0 couples sender and receiver into one event — the block IS the guarantee. cap N buys slack, and slack is where a stalled receiver hides.
+
+      When every goroutine is blocked, the runtime gives you its one loud failure:
+      `fatal error: all goroutines are asleep - deadlock!`, then a dump of each goroutine
+      with its wait state — `[chan send]`, `[chan receive]`, `[select]` — read the state, it
+      names the stuck operation (GOTRACEBACK=none/all/system scales how much dump you get).
+      Scope matters: the detector is whole-program. Two workers deadlocked with each other
+      while main keeps serving print NOTHING — that subset is a goroutine leak (go04a's
+      drain discipline), not a fatal error. A real service like conclave's server always has
+      a live accept loop, so it will never be all-asleep; treat the fatal error as a gift of
+      tiny programs and tests.
+  - heading: "capacity is a correctness decision, not a tuning knob"
+    covers: [go04b-o2, go04b-o3]
+    body: |
+      Capacity answers one question: how many sends may complete before a receive MUST
+      happen? Choose it by proof, not vibes. cap 0: completion handshakes and ownership
+      transfer, when the sender must not proceed until the value is taken — the block is the
+      feature. cap 1, first use — the single-shot mailbox: when the total send count is
+      provably 1 (an exit report), the one send parks without blocking, by construction.
+      cap 1, second use — the latest-value slot: repeated sends REUSE the slot, so a send
+      can find it full; the drop-old variant evicts, and the evict must itself be
+      non-blocking:
+
+      ```go
+      select {
+      case slot <- v: // empty: park the fresh value
+      default: // full: evict, then park -- non-blockingly
+      	select {
+      	case <-slot: // drained the stale value ourselves
+      	default: // consumer took it between the two selects
+      	}
+      	slot <- v // empty again, and we are the ONLY sender: cannot block
+      }
+      ```
+
+      The tempting flat version — `default: <-slot; slot <- v` — is itself a blocking bug:
+      if the consumer drains between the outer select committing to `default` and `<-slot`
+      running, the producer parks in a receive nobody will ever satisfy (measured: a
+      1-producer/1-consumer stress loop of 5M sends died in `fatal error: all goroutines
+      are asleep - deadlock!` in 5 of 5 runs). One producer only: a second sender can
+      refill the slot between the evict and the re-send.
+
+      cap N is legal only with a named overflow policy: what happens on send N+1 — block
+      (then N bought you latency, not safety), drop-new, drop-old? No burst bound and no
+      policy means N is a guess.
+
+      The anti-pattern, conclave-shaped: the signaling loop feeds each peer's writer
+      goroutine over an unbuffered channel. A writer stalls, the loop freezes on
+      `peerCh <- ev`, and a teammate "fixes" it with `make(chan event, 64)` — the freeze
+      vanishes in testing. Nothing is fixed: the receiver is still gone, the loop now
+      absorbs exactly 64 events and freezes on the 65th, and the stall finally surfaces
+      behind 64 stale events of latency. The rendezvous WAS your backpressure and your
+      early warning; the buffer deleted both.
+
+      > [!KEY] A buffer never fixes a missing receiver — it reschedules the same deadlock for burst N+1 and hides it until then.
+
+worked_examples:
+  - id: go04b-w1
+    covers: [go04b-o1, go04b-o3]
+    prompt: |
+      Without running it, walk through this main (the whole program):
+
+      ```go
+      ch := make(chan int, 2)
+      ch <- 1
+      ch <- 2
+      ch <- 3
+      fmt.Println(<-ch)
+      ```
+
+      (a) Which statement blocks forever, and what are len/cap at that instant?
+      (b) What exactly does the runtime print, and which wait state does goroutine 1 show?
+      (c) Change the cap to 3: now what does the program print — and what does that
+      one-digit difference tell you about buffered "fixes"?
+    solution: |
+      (a) Sends 1 and 2 park in the buffer (len 0→1→2) with no receiver needed. Send 3
+      finds len == cap == 2 and blocks; main is the only goroutine, so ALL goroutines
+      (1 of 1) are asleep. The receive one line down never runs — a receive that WOULD
+      unblock the send is worthless if control flow cannot reach it.
+      (b) The runtime prints `fatal error: all goroutines are asleep - deadlock!` and dumps
+      goroutine 1 as `[chan send]` — the wait state names the stuck operation. The trailing
+      `exit status 2` line is `go run` relaying the exit code, not the runtime.
+      (c) cap 3: all three sends park, `<-ch` drains one, it prints 1, and the program
+      exits cleanly. Same code; one capacity digit is the whole distance between a crash
+      and green — which is why capacity is a correctness decision, and why a buffer can
+      hide this exact bug until the day the burst is 4.
+
+assessments:
+  - id: go04b-a1
+    type: predict_output
+    covers: [go04b-o1]
+    difficulty: easy
+    prompt: |
+      This whole program is one goroutine. Predict the COMBINED output (stdout + stderr, in
+      order) of `go run .` — your answer must include the runtime's exact fatal error line.
+      The //line directive only pins the file name shown in the dump; it changes no behavior.
+    grading:
+      strategy: deterministic_output
+      runner: "go run"
+      stream: combined
+      match: contains
+      program: |
+        // The //line directive below pins the file name the runtime records in the
+        // goroutine dump, so this program's output is byte-identical wherever it lives.
+        //
+        //line rendezvous.go:1
+        package main
+
+        import "fmt"
+
+        func main() {
+        	done := make(chan struct{}) // cap 0: rendezvous -- a send needs a ready receiver
+        	fmt.Println("peer exiting, signalling done")
+        	done <- struct{}{} // main is the ONLY goroutine; a receiver can never arrive
+        	fmt.Println("supervisor notified")
+        }
+      expected_output: "all goroutines are asleep - deadlock!"
+
+  - id: go04b-a2
+    type: predict_output
+    covers: [go04b-o1]
+    difficulty: medium
+    prompt: |
+      The same question asked politely: select with a default arm reports instead of
+      blocking. Predict the exact stdout (5 lines). Be careful with len and cap on the
+      unbuffered channel.
+    grading:
+      strategy: deterministic_output
+      runner: "go run"
+      match: trimmed
+      program: |
+        package main
+
+        import "fmt"
+
+        func main() {
+        	rendezvous := make(chan int) // cap 0: a send completes only WITH a receiver
+        	mailbox := make(chan int, 1) // cap 1: one send can park a value and move on
+
+        	probe := func(name string, ch chan int, v int) {
+        		select {
+        		case ch <- v:
+        			fmt.Printf("%s <- %d: accepted, len=%d cap=%d\n", name, v, len(ch), cap(ch))
+        		default:
+        			fmt.Printf("%s <- %d: would block, len=%d cap=%d\n", name, v, len(ch), cap(ch))
+        		}
+        	}
+
+        	probe("rendezvous", rendezvous, 1)
+        	probe("mailbox", mailbox, 2)
+        	probe("mailbox", mailbox, 3)
+        	fmt.Println("drained:", <-mailbox)
+        	probe("mailbox", mailbox, 4)
+        }
+      expected_output: |
+        rendezvous <- 1: would block, len=0 cap=0
+        mailbox <- 2: accepted, len=1 cap=1
+        mailbox <- 3: would block, len=1 cap=1
+        drained: 2
+        mailbox <- 4: accepted, len=1 cap=1
+
+  - id: go04b-a3
+    type: mcq
+    covers: [go04b-o2]
+    difficulty: medium
+    prompt: |
+      A conclave peer goroutine, when it dies, must hand the supervisor exactly ONE
+      exitReport (reason + bytes relayed) and then terminate immediately — even if the
+      supervisor is mid-election and will not collect reports for a few seconds. The
+      supervisor creates one such channel per peer. Which declaration is right?
+    grading:
+      strategy: deterministic_choice
+      options:
+        - text: "make(chan exitReport) — unbuffered, the classic completion signal"
+          correct: false
+          why: "cap 0 is a rendezvous: the dying peer blocks in the send until the supervisor receives. A supervisor busy in a 3 s election round pins the peer for 3 s, and one that already deregistered the peer never receives at all — the peer leaks forever."
+        - text: "make(chan exitReport, 1) — a one-slot mailbox"
+          correct: true
+          why: "Max in-flight is provably 1 (each peer sends exactly once), so cap 1 makes the send non-blocking by construction: park the report, exit now; the supervisor collects whenever it is ready. Capacity == provable max in-flight is the justification rule."
+        - text: "make(chan exitReport, 64) — headroom so it can never block"
+          correct: false
+          why: "The send count is 1 by construction, so cap 1 already can never block; the extra 63 slots document a burst that cannot exist. Unjustified headroom is exactly the 'buffer until the warning goes away' habit the critique item dissects."
+        - text: "make(chan struct{}) that the peer closes, like context.Done"
+          correct: false
+          why: "close broadcasts 'no more values' but carries none: the supervisor wakes to a zero value and the exit reason and byte count are gone. Right idiom for pure completion (go04a); wrong the moment the signal has a payload."
+    reference_answer: "make(chan exitReport, 1) — a one-slot mailbox"
+
+  - id: go04b-a4
+    type: explain_tradeoff
+    covers: [go04b-o2, go04b-o3]
+    difficulty: hard
+    prompt: |
+      In conclave's signaling loop each peer has an events channel drained by that peer's
+      writer goroutine. Under load one writer stalled and the whole loop froze on
+      `peerCh <- ev` (unbuffered). A teammate changed it to `make(chan event, 64)`; the
+      freeze disappeared in testing and the PR description says "fixed the deadlock". In
+      writing, critique the fix: what actually changed, when and how the original bug comes
+      back (give the number), what property the unbuffered send provided that is now gone,
+      and what you would do instead — name at least one rejected alternative and include at
+      least one quantified claim.
+    grading:
+      strategy: llm_judge
+      judge_mode: rubric
+      rubric:
+        pass_threshold: 0.6
+        criteria:
+          - { id: c1, weight: 0.4, text: "States that the buffer defers rather than repairs: the untouched receiver bug returns at burst N+1 (names 65 for cap 64), now surfacing behind N stale queued events" }
+          - { id: c2, weight: 0.3, text: "Names what cap 0 provided — backpressure plus immediate, at-the-bug failure — and the new failure mode (late freeze, stale delivery, a 64 × sizeof(event) buffer paid up front per peer, 64 stale events pinned per stalled peer)" }
+          - { id: c3, weight: 0.3, text: "Proposes the real fix (repair the writer's lifecycle, or an explicit overflow policy such as a cap-1 drop-old slot) AND names a rejected alternative with a quantified claim" }
+        anti_reward_hacking: { min_words: 40, penalize_if_contains: ["as an AI", "it depends"] }
+    reference_answer: |
+      make(chan event, 64) did not fix the deadlock — it rescheduled it. The unbuffered
+      send froze the loop because the peer's writer goroutine stopped receiving; that
+      receiver bug is untouched. With cap 64 the loop absorbs exactly 64 events and freezes
+      again on the 65th, and every queued event is stale by the time anyone looks. The
+      rendezvous WAS the backpressure: at cap 0 a dead writer stalls the loop at depth 1,
+      loudly, at the bug; cap 64 buys quiet-and-late instead, and its price is paid twice —
+      a 64 × sizeof(event) buffer allocated at make for EVERY peer, stalled or not, plus 64
+      stale queued events pinned alive per stalled peer. The real fix is the receiver's lifecycle: the
+      writer selects on ctx.Done, and the loop deregisters a dead peer instead of sending
+      to it. If decoupling is genuinely wanted, name the policy — a cap-1 latest-value slot
+      that drops the stale event, or a capacity derived from a measured burst bound.
+      Rejected alternative: cap 1024 "to be safe" — the identical freeze at event 1025,
+      sixteen times the stale backlog, and still no overflow policy.
+
+limitations: >
+  a1's loud crash exists only because ALL goroutines were asleep — the detector is
+  whole-program, so the identical capacity bug in a real service (conclave's server always
+  has a live accept loop) prints nothing and just leaks; a green prediction here does not
+  mean production deadlocks announce themselves. a2's select/default is a point-in-time
+  probe: it proves this single-goroutine sequence blocks HERE, not that a send never blocks
+  under concurrent interleavings — len(ch) is stale the instant it is read. Choosing 0/1/N
+  correctly in these scenarios also does not size a real burst bound: that takes a measured
+  producer rate (events/s), which this lesson only names. And the //line pin in a1 exists
+  solely to make the output byte-reproducible; real tracebacks print your absolute paths.

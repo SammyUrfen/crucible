@@ -1,0 +1,68 @@
+# 07 — Landscape: prior art, what to steal, and why Crucible orchestrates over labs
+
+This doc surveys the interactive "learn + test" tools worth learning from, extracts one idea to steal and one to reject from each, and then states Crucible's positioning: it is an **orchestrator and tracker layered over best-in-class external labs**, not a re-implementation of their graders. The single organizing insight from the survey is that **the grading mechanism — not the content or the UI — is the real design axis**, and the surveyed tools form a rigor ladder from self-graded recall up to adversarial fault-injection.
+
+## The rigor ladder
+
+Ordered by how objective and how adversarial the grader is:
+
+1. **Self-graded recall** — Anki/FSRS. You mark your own memory.
+2. **Visible unit tests** — A Tour of Go, boot.dev. The test is shown; passing is easy to reverse-engineer.
+3. **Hidden test batteries with partial credit** — LeetCode, nbgrader/Otter. The grader catches edge cases you did not consider.
+4. **Black-box protocol conformance against a real client** — CodeCrafters. Your binary must speak the real protocol to a real off-the-shelf client.
+5. **Adversarial fault-injection property checking** — Fly.io Gossip Glomers / Jepsen Maelstrom, MIT 6.824. A nemesis injects partitions/delays/loss and a checker asserts an invariant survived, reporting the quantitative cost.
+
+For this learner the two top rungs are the ones worth building the workbook *around*, because only they are simultaneously **objective** and **reward from-scratch construction** — his exact ethos. Everything below rung 4 is a delivery-format or reference-reading donor, not a grading model to copy.
+
+## Tool-by-tool: mechanism, grading, steal, reject
+
+| Tool | Mechanism | Grading approach | STEAL | REJECT |
+|---|---|---|---|---|
+| **Exercism** | Download exercise, solve locally, submit; then a volunteer mentor reviews idiom in a second pass | Canonical test suite (some edge cases hidden) + qualitative human mentor review | The two-layer "green tests, THEN make it idiomatic" loop — the mentor becomes a self-run adversarial idiom review against a checklist | Human mentoring does not scale solo; the suites skew gentle/toy — too soft a correctness gate for him |
+| **CodeCrafters** | Build your own Redis/Git/SQLite/HTTP/DNS/Kafka in ordered stages; git push runs a remote harness that black-box tests your real binary against a real client | Per-stage TDD tests on push; conformance against the actual protocol, not a mock; stage N unlocks N+1 | *(Highest value)* stage-gated build-your-own-primitive verified by black-box conformance against a real client | Prescribes the exact next micro-step (low ambiguity — he should sometimes design the stage boundaries himself); paywalled/closed |
+| **Fly.io Gossip Glomers + Jepsen Maelstrom** | One node speaks JSON over stdin/stdout; Maelstrom (on Jepsen) routes messages, injects partitions/delays/loss, verifies the invariant (unique-ids, broadcast convergence, g-counter, replicated log, linearizable KV+txn), reports latency + msgs/op | Property-based consistency checker under fault injection + quantitative cost report | *(Highest value)* a checker that injects faults, asserts an invariant, AND reports the quantitative cost (msgs/op, p50/p99) — pushes him past interview-level into distributed internals | Essentially nothing; only caveat: Maelstrom's node protocol is fixed, so bespoke systems need his own harness in the same spirit |
+| **MIT 6.824** | Distributed-systems labs (MapReduce, Raft, fault-tolerant KV, sharded KV) run under a public test battery that injects crashes, partitions, and unreliable networks | Test scripts assert linearizability/agreement across many randomized-failure runs; must pass repeatedly | The randomized-failure-repeated-run discipline (a single green run is not a pass) and the canonical Raft/KV spec as a ready-made external autograder | The academic framing and staff-only extensions; not packaged as a daily workbook, so it is a lab to *orchestrate over*, not a UI to copy |
+| **boot.dev** | Linear career path: in-browser lessons + CLI-submitted real Go/Python projects (web crawler, Pokedex CLI), wrapped in XP/streaks/boss-battles | Unit tests per lesson; CLI projects checked by a runner | The structured "build a real Go CLI end-to-end" beginner projects for his Go on-ramp — good shape | The gamification layer (XP/streaks/boss-battles) — motivation scaffolding + rote-recall-adjacent that a self-driven learner dislikes; keep the project, drop the game |
+| **educative.io** | Text-first, no-video courses with in-browser runnable widgets and quizzes; "Grokking the System Design Interview" | Quizzes + runnable widgets; weak-to-absent autograding; system-design courses effectively read-only | The text-first / no-video / runnable-inline delivery format for a fast reader | Its system-design depth is interview-level (he is explicitly past that); its grading is passive — do not model rigor on it |
+| **Anki + FSRS** | Flashcards scheduled by FSRS (Anki default since v23.10, Nov 2023), modeling each card by Difficulty, Stability, and power-law-decaying Retrievability, fine-tuned on your review log | Pure self-graded recall (Again/Hard/Good/Easy) | A *small* FSRS deck over only genuinely-rote items (Go idioms/APIs and error-wrapping he re-looks-up); benchmarks on 500M+ reviews show ~20–30% fewer reviews than SM-2 for equal retention | He dislikes rote recall and learns by building — do NOT make the workbook a flashcard app; spaced repetition is a narrow adjunct, not the core |
+| **A Tour of Go + Go by Example** | Tour: official in-browser sandbox, editable/runnable snippets + a few real exercises (image, equivalent binary trees, concurrent crawler). Go by Example: annotated runnable one-concept programs | Tour auto-checks a couple of exercises, mostly self-check; Go by Example none | The "annotated runnable example per concept" format for a Go-idioms reference; the Tour concurrency exercises as from-scratch katas seeding his Go modules | No real grading; too basic to *be* the workbook — it is the on-ramp, not the assessment |
+| **Real Python** | Deep long-form code-along tutorials + learning paths + recall quizzes | Quizzes are recall; no real autograding — passive consumption | The depth/quality of explanation ("code along a real thing" on asyncio, typing, packaging) as reference reading for Python-deep modules | Quiz-based recall grading and passive consumption — not an assessment model for him |
+| **LeetCode** | Submit a function; run against hidden tests + a few visible samples under time/memory limits; instant AC/WA/TLE | Hidden test battery + explicit perf limits | The hidden-edge-case battery + explicit time/space budget as the objective correctness gate (he already reports p50/p99) | (a) the CONTENT — algorithm-puzzle rote he dislikes; (b) the OPACITY — steal the hidden-test mechanism but SHOW the minimal failing input |
+| **nbgrader / Otter-Grader** | Instructor authors assert-based test cells (visible = formative, hidden = summative) with per-test points; grades notebooks or plain `.py` against a rubric | Assert-based cells, visible/hidden split, points per test | The visible-guide / hidden-verify split with partial credit — implementable as plain pytest tiers he already lives in | Notebook-centricity (he is CLI/pytest/mypy, not notebooks) and classroom point-scoring overhead that is meaningless solo |
+| **roadmap.sh** | Visual prerequisite graphs (backend, DevOps, system design, Go, Python) with curated links per node and self-checked boxes | None — self-marked checkboxes; some AI-generated quizzes; link quality varies | The dependency-graph as the workbook's *skeleton* (explicit prereq edges between modules) plus a gap-audit checklist | No grading, breadth-over-depth, variable link quality — a map is not a workbook, and checking boxes is not competence |
+
+## The centerpiece: orchestrate over labs, don't re-implement them (R6)
+
+The research names the failure mode plainly: **building the grading infrastructure eats the learning time**, and "the harness can crowd out the actual studying." CodeCrafters and Fly.io each spent real engineering on their harnesses; MIT 6.824's failure-injection test battery is a decade-hardened artifact. If Crucible hand-rolls a sandbox, a hidden-test tier, and a fault-injection checker to grade exactly the build-a-primitive and distributed work those tools *already grade better*, it concentrates its scarce build budget where external tools win and leaves it thin where the workbook is actually differentiated. A predictable abandonment path follows: partway in he notices 6.824/Maelstrom/CodeCrafters grade this more rigorously than his wrapper and concludes he should just do the labs directly.
+
+**The chosen design, and its named rejected alternative.** Crucible is positioned as an **orchestrator/tracker layered over external labs**. The rejected alternative is the **replacement grader** — hand-rolling the sandbox + hidden-tests + nemesis to own code conformance end-to-end. It is rejected because the external graders are better, canonical, and free-to-reuse, and because duplicating them is the exact way the harness crowds out the studying. So:
+
+- **Reuse for code + distributed conformance:** MIT 6.824's autograder (Raft/KV), Jepsen Maelstrom / Gossip Glomers (invariant-under-nemesis + msgs/op + p50/p99), and CodeCrafters-style stage-gated protocol conformance. For the self-hosted slices where no external checker exists, hand-roll one **only there**, and in the same adversarial, quantitative spirit (test-first, real client, cost report).
+- **Grade locally with plain tools where a computable oracle exists:** plain `go test` / `pytest`, the visible-guide / hidden-verify split (from nbgrader/Otter) with the counterexample surfaced on failure (rejecting LeetCode's opacity). This is the descoped v1 posture — his own code on his own machine, plain local execution (see [`03-architecture.md`](03-architecture.md) and [`04-grading.md`](04-grading.md)).
+
+**What Crucible uniquely adds** — the differentiators, none of which any surveyed tool provides:
+
+- **A design-defense LLM-judge on his own repos** — reference-grounded, reading-comprehension and defend-and-extend items over `conclave`/WALterDB/GOOGLY, graded against the **rejected-alternative rubric** ("name the WHY + the named rejected alternative + the failure mode + a number, or it fails"). This is the exercism idiom-review pass converted into a solo adversarial review, and it needs *only* the hosted judge — **not** the heavy sandbox. (The judge is a hosted, metered Anthropic API call, not offline — see [`04-grading.md`](04-grading.md).)
+- **Spacing / interleaving** — an FSRS micro-deck over the genuinely-rote only, plus interleaved review ordering; never the core.
+- **Mastery / θ tracking** — a per-skill ability estimate and a discrete unlock latch with prereq-propagation priors from the roadmap.sh-style dependency skeleton (see [`06-progress-model.md`](06-progress-model.md)).
+- **Numbers-over-adjectives reporting and correctness-weighted rubrics** — every build-your-own item emits p50/p99, msgs/op, and throughput delta vs a baseline, and rubric arithmetic honors **Correctness > Reliability > UX > Maintainability > Performance** (a fast solution that fails a fault-injection invariant scores below a slower correct one).
+
+For how these differentiators land as concrete P0/P1/P2 features, see [`02-features.md`](02-features.md).
+
+## Differentiators, condensed
+
+1. **Orchestrator, not replacement grader** — reuse 6.824/Maelstrom/CodeCrafters for conformance; hand-roll a grader only where none exists.
+2. **Design-defense judge on his own repos** with the rejected-alternative rubric — the one thing no lab does.
+3. **Per-language altitude asymmetry** — Go starts as a scaffolded on-ramp (Tour/boot.dev shape) then ramps to from-scratch primitives; Python starts deep and adversarial (hidden-test batteries, mypy-strict) from day one.
+4. **Numbers, not pass/fail** — p50/p99, msgs/op, throughput deltas as first-class grading output.
+5. **Correctness-weighted rubric arithmetic** matching his stated value order.
+6. **Hidden-test rigor without opacity** — surface the minimal failing input on failure.
+7. **Dependency-graph skeleton + mastery/θ tracking + a narrow FSRS adjunct** — none of which the labs provide.
+
+## Limitations / what this does not prove
+
+- **The survey is qualitative.** The "steal/reject" calls are judgment about fit to *this* learner, not measured outcomes; the only hard numbers are external (FSRS ~20–30% fewer reviews than SM-2 on 500M+ reviews; Anki FSRS-default since v23.10). Whether orchestrating-over-labs actually beats doing the labs raw is an empirical question the R2 content-first pilot is meant to answer (see [`09-roadmap.md`](09-roadmap.md)).
+- **Reuse has a real seam cost.** "Layer over 6.824/Maelstrom/CodeCrafters" hides integration work — Maelstrom's node protocol is fixed, CodeCrafters is paywalled/closed and cannot be scripted against, and 6.824's harness is a Go test tree, not an API. The orchestration is looser (invoke the lab, ingest its verdict/metrics into the θ store) than "one grading pipeline" implies.
+- **Open question (from the research):** for distributed modules, use Maelstrom directly (canonical spec, batteries-included checker, fixed protocol) or a bespoke in-process nemesis (more from-scratch, more effort, full control)? The trade-off — canonical external spec vs full control — is unresolved and should be decided per-module, not globally.
+
+_Source: [`../RESEARCH/landscape.md`](../RESEARCH/landscape.md)._
