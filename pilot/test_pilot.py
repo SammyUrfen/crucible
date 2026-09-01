@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from pilot import extract_json, score_from_criteria  # noqa: E402
+from pilot import ANSWER_MARKER, build_header, extract_json, score_from_criteria  # noqa: E402
 
 CRITERIA = [
     {"id": "c1", "weight": 0.5, "text": "names the rejected alternative"},
@@ -29,6 +29,28 @@ def test_extract_json() -> None:
     assert extract_json("no json here") is None
     assert extract_json("{not valid}") is None
     assert extract_json('[1,2,3]') is None  # top-level array is not a grade envelope
+
+
+def test_strip_header_round_trip() -> None:
+    """The brief we inject must never survive into the graded answer — in either comment syntax."""
+    from pilot import strip_header
+
+    item = {"id": "go04a-a4", "type": "explain_tradeoff", "prompt": "Defend the closer goroutine."}
+    answer = "My answer.\nSecond line."
+
+    md = build_header(item, ["GRADED ON", "  [50%] names it"], wrap=("<!--", " -->")) + answer
+    assert strip_header(md).strip() == answer
+    assert "QUESTION" not in strip_header(md) and "-->" not in strip_header(md)
+
+    go = build_header(item, [], line_prefix="// ") + "package crucible\n"
+    assert strip_header(go).strip() == "package crucible"
+    # the Go brief must be valid Go even if stripping never happened
+    assert all(ln.startswith("//") or not ln.strip() for ln in go.split(ANSWER_MARKER)[0].splitlines())
+
+    # no marker => the text is already all the learner's, return it untouched
+    assert strip_header("just my answer") == "just my answer"
+    # a learner who deletes the marker keeps their whole answer rather than losing it
+    assert strip_header(answer) == answer
 
 
 def test_score_from_criteria() -> None:
@@ -49,5 +71,6 @@ def test_score_from_criteria() -> None:
 
 if __name__ == "__main__":
     test_extract_json()
+    test_strip_header_round_trip()
     test_score_from_criteria()
     print("pilot self-check: all assertions passed")

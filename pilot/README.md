@@ -19,6 +19,21 @@ Uses the `crucible` conda env (wired into the Makefile) and the system Go toolch
 (go1.26.x). Set `$EDITOR` for code/essay items; unset, the harness waits while you edit the
 answer file in another window.
 
+### Writing an answer (essay + code items)
+
+The question does not stay on screen once `$EDITOR` takes the terminal, so it is written
+**into the answer file** as a comment block — question, every rubric criterion, the word
+floor, the pass mark — above a `WRITE YOUR ANSWER BELOW THIS LINE` marker. Everything above
+that marker is stripped before grading, so it never counts as your words. In a `.go` answer
+the brief is `//` comments, which still compile if the strip ever misses.
+
+You get to read the question and press `?` **before** the editor opens. If a saved answer
+from an earlier day is already in the file, the harness says when you wrote it and how long
+it is, and asks `[c]ontinue it / [f]resh start` rather than silently handing you stale work.
+Quitting the editor without saving does **not** grade an empty answer — it offers
+`[e]dit again / [s]kip this item`, and a skip logs nothing at all (an unattempted item is
+not a failure and must not enter the first-try pass rate).
+
 **Press `?` at any prompt** for an "explain like I'm 10" hint on whatever is on screen. Hints
 are reference-free by construction — the prompt forbids revealing a graded answer, and the
 model only ever sees the teach material, never the rubric or the reference. Each hint bumps

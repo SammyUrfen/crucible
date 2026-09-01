@@ -34,12 +34,15 @@ import random
 import re
 import resource
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -266,42 +269,53 @@ def run_cmd(args: list[str], cwd: Path, timeout_s: float = DEFAULT_TIMEOUT_S) ->
     return RunResult(p.returncode, p.stdout, p.stderr)
 
 
-def new_module(files: dict[str, str]) -> Path:
+@contextmanager
+def temp_module(files: dict[str, str]) -> Iterator[Path]:
+    """A throwaway Go module, removed on the way out.
+
+    Every RunResult is captured before the directory dies, so nothing diagnostic is lost. It has
+    to be a context manager rather than a plain mkdtemp: a full `make verify` composes ~45
+    modules and each `-race` binary is heavy, so leaving them behind grew the repo by ~28 MB per
+    run with nothing ever reaping them.
+    """
     SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
     mod = Path(tempfile.mkdtemp(prefix="run-", dir=SCRATCH_DIR))
     (mod / "go.mod").write_text(GO_MOD)
     for name, content in files.items():
         (mod / name).write_text(content if content.endswith("\n") else content + "\n")
-    return mod
+    try:
+        yield mod
+    finally:
+        shutil.rmtree(mod, ignore_errors=True)
 
 
 def go_test(learner_code: str, test_code: str, timeout_ms: int) -> RunResult:
-    mod = new_module({"answer.go": learner_code, "lesson_test.go": test_code})
-    return run_cmd(
-        ["go", "test", "-race", "-count=1", f"-timeout={timeout_ms}ms", "."], cwd=mod
-    )
+    with temp_module({"answer.go": learner_code, "lesson_test.go": test_code}) as mod:
+        return run_cmd(
+            ["go", "test", "-race", "-count=1", f"-timeout={timeout_ms}ms", "."], cwd=mod
+        )
 
 
 def go_run_program(program: str) -> RunResult:
-    mod = new_module({"main.go": program})
-    return run_cmd(["go", "run", "."], cwd=mod)
+    with temp_module({"main.go": program}) as mod:
+        return run_cmd(["go", "run", "."], cwd=mod)
 
 
 def race_observations(program: str, iterations: int) -> tuple[int, int, str]:
     """Build once with -race, run N times; return (races_observed, runs, sample_report)."""
-    mod = new_module({"main.go": program})
-    build = run_cmd(["go", "build", "-race", "-o", "prog", "."], cwd=mod)
-    if build.returncode != 0:
-        raise RuntimeError(f"race program does not build:\n{build.combined}")
-    observed = 0
-    sample = ""
-    for _ in range(iterations):
-        r = run_cmd([str(mod / "prog")], cwd=mod, timeout_s=RACE_RUN_TIMEOUT_S)
-        if "WARNING: DATA RACE" in r.combined:
-            observed += 1
-            if not sample:
-                sample = r.combined
-    return observed, iterations, sample
+    with temp_module({"main.go": program}) as mod:
+        build = run_cmd(["go", "build", "-race", "-o", "prog", "."], cwd=mod)
+        if build.returncode != 0:
+            raise RuntimeError(f"race program does not build:\n{build.combined}")
+        observed = 0
+        sample = ""
+        for _ in range(iterations):
+            r = run_cmd([str(mod / "prog")], cwd=mod, timeout_s=RACE_RUN_TIMEOUT_S)
+            if "WARNING: DATA RACE" in r.combined:
+                observed += 1
+                if not sample:
+                    sample = r.combined
+        return observed, iterations, sample
 
 
 def tail(text: str, lines: int = MAX_LOG_LINES) -> str:
@@ -492,6 +506,100 @@ def show_code(code: str, indent: str = "  ") -> None:
         print(indent + C.cyan(line))
 
 
+# ------------------------------------------------------------------------- answer-file plumbing
+# Everything above this marker is a brief we wrote, not work he wrote, so it is stripped before
+# grading. Kept identical in both comment syntaxes so ONE strip rule covers .md and .go.
+ANSWER_MARKER = "═══ WRITE YOUR ANSWER BELOW THIS LINE ═══"
+
+
+class SkipItem(Exception):
+    """Raised when the learner declines an item. Nothing is logged — an unattempted item is not
+    a failure, and recording it as one would poison the first-try pass rate."""
+
+
+def strip_header(text: str) -> str:
+    """Drop the question brief we injected. Absent marker => the text is already all his."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if ANSWER_MARKER in line:
+            return "\n".join(lines[i + 1 :]).strip("\n")
+    return text
+
+
+def build_header(
+    assessment: dict[str, Any],
+    extra: list[str],
+    *,
+    line_prefix: str = "",
+    wrap: tuple[str, str] = ("", ""),
+) -> str:
+    """The question + what it is graded on, as a comment inside the answer file itself.
+
+    WHY this exists: $EDITOR takes over the whole terminal, so anything printed before it is gone
+    the moment nano opens. The brief has to travel INSIDE the file or it may as well not exist.
+
+    Two comment shapes, one strip rule: Go gets a `//` prefix per line, Markdown gets a single
+    `<!-- ... -->` wrapper whose closer rides on the marker line so nothing survives above the
+    answer body.
+    """
+    lines = [f"{assessment['id']}  ({assessment.get('type', '')})", "", "QUESTION"]
+    lines += [f"  {ln}" for ln in str(assessment.get("prompt", "")).strip().splitlines()]
+    if extra:
+        lines += ["", *extra]
+    lines.append("")
+    out = [f"{line_prefix}{ln}".rstrip() for ln in lines]
+    out.append(f"{line_prefix}{ANSWER_MARKER}{wrap[1]}")
+    if wrap[0]:
+        out.insert(0, wrap[0])
+    return "\n".join(out) + "\n\n"
+
+
+def prepare_answer_file(
+    path: Path,
+    assessment: dict[str, Any],
+    extra: list[str],
+    seed: str = "",
+    *,
+    line_prefix: str = "",
+    wrap: tuple[str, str] = ("", ""),
+) -> None:
+    """Write a fresh brief on top of whatever body already exists, asking before reusing old work."""
+    ANSWERS_DIR.mkdir(parents=True, exist_ok=True)
+    body = ""
+    if path.exists():
+        body = strip_header(path.read_text()).strip("\n")
+        if body.strip():
+            when = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            words = len(body.split())
+            print(C.orange(f"\n  a saved answer from {when} is already in this file "
+                           f"({words} words, {len(body.splitlines())} lines)"))
+            keep = ask("  [c]ontinue it / [f]resh start: ").strip().lower()
+            if keep.startswith("f"):
+                body = ""
+                print(C.dim("  starting fresh"))
+    if not body.strip():
+        body = seed.strip("\n")
+    header = build_header(assessment, extra, line_prefix=line_prefix, wrap=wrap)
+    path.write_text(header + body + "\n")
+
+
+def edit_answer(path: Path, what: str) -> str:
+    """Open $EDITOR, read the answer back, and refuse to grade an empty one silently.
+
+    Quitting the editor without writing is a normal accident (that is exactly how the first real
+    session died); it must offer the editor again, not fall through into grading nothing.
+    """
+    while True:
+        open_editor(path)
+        body = strip_header(path.read_text()).strip()
+        if body:
+            return body
+        print(C.orange(f"\n  the {what} is still empty — nothing was saved to the file."))
+        choice = ask(f"  [e]dit again / [s]kip this item / {QUIT_KEY} to end: ").strip().lower()
+        if choice.startswith("s"):
+            raise SkipItem
+
+
 # ------------------------------------------------------------------------------------ graders
 def grade_choice(assessment: dict[str, Any]) -> dict[str, Any]:
     g = assessment["grading"]
@@ -582,36 +690,41 @@ def grade_race_verdict(assessment: dict[str, Any]) -> dict[str, Any]:
 def grade_hidden_tests(assessment: dict[str, Any], review: bool) -> dict[str, Any]:
     g = assessment["grading"]
     aid = assessment["id"]
-    ANSWERS_DIR.mkdir(parents=True, exist_ok=True)
     answer_path = ANSWERS_DIR / f"{aid}.go"
-    if not answer_path.exists():
-        seed = g.get("buggy") if assessment.get("type") == "debug_this" else g.get("starter", "")
-        answer_path.write_text(seed or "package crucible\n")
     tests_meta = g.get("tests", [])
     visible = [t for t in tests_meta if t.get("visible")]
     hidden_n = len(tests_meta) - len(visible)
+    extra: list[str] = []
     if visible:
-        print(C.dim("\n  checked (visible):"))
-        for t in visible:
-            print(C.dim(f"    - {t['name']}: {t.get('golden', '')}"))
+        extra.append("CHECKED (visible tests)")
+        extra += [f"  - {t['name']}: {t.get('golden', '')}" for t in visible]
     if hidden_n:
-        print(C.dim(f"    ...plus {hidden_n} hidden check(s)"))
-    print(f"\n  your answer file: {C.cyan(str(answer_path))}")
+        extra.append(f"  ...plus {hidden_n} hidden check(s)")
+    for line in extra:
+        print(C.dim("  " + line))
+    seed = g.get("buggy") if assessment.get("type") == "debug_this" else g.get("starter", "")
+    prepare_answer_file(answer_path, assessment, extra, seed or "package crucible\n",
+                        line_prefix="// ")
+    print(f"\n  answer file: {C.cyan(str(answer_path))}  "
+          + C.dim("(the question is repeated inside it)"))
+    pause("read the question above, then Enter to open $EDITOR")
     timeout_ms = int(g.get("timeout_ms", 30000))
     attempts = 0
     last: RunResult | None = None
     while True:
-        open_editor(answer_path)
+        code = edit_answer(answer_path, "code")
         attempts += 1
         print(C.dim("  go test -race ..."))
-        last = go_test(answer_path.read_text(), g["test_code"], timeout_ms)
+        last = go_test(code, g["test_code"], timeout_ms)
         if last.returncode == 0:
             print(C.green("  all tests green"))
             return envelope(1.0, 1.0, "PASS", grader_id="hidden_tests",
                             evidence=f"attempts={attempts}", logs=tail(last.combined))
         print(C.red("\n  tests failed:"))
         show_code(tail(last.combined))
-        nxt = ask("\n  [e]dit & retry / [f]ail item: ").strip().lower()
+        nxt = ask("\n  [e]dit & retry / [f]ail item / [s]kip (not logged): ").strip().lower()
+        if nxt.startswith("s"):
+            raise SkipItem
         if nxt.startswith("f"):
             break
     if review or ask("  show reference solution? [y/n]: ").strip().lower().startswith("y"):
@@ -643,15 +756,27 @@ def score_from_criteria(
 
 
 def collect_essay(assessment: dict[str, Any]) -> tuple[str, Path]:
-    """Open the answer file in $EDITOR and read it back. Persists so you can iterate across days."""
-    aid = assessment["id"]
-    ANSWERS_DIR.mkdir(parents=True, exist_ok=True)
-    answer_path = ANSWERS_DIR / f"{aid}.md"
-    if not answer_path.exists():
-        answer_path.write_text("")
-    print(f"\n  write your answer in: {C.cyan(str(answer_path))}")
-    open_editor(answer_path)
-    return answer_path.read_text().strip(), answer_path
+    """Show what is being graded, then open the answer file. Persists across days."""
+    g = assessment["grading"]
+    rubric = g["rubric"]
+    anti = rubric.get("anti_reward_hacking", g.get("anti_reward_hacking", {}))
+    # The rubric is the actual question. Hiding it until self-grade time (the old behaviour) made
+    # the criteria read as a quiz you were being asked, instead of the bar you were writing to.
+    extra = ["GRADED ON — every criterion is a thing your answer must DO"]
+    extra += [f"  [{float(c['weight']):.0%}] {c['text']}" for c in rubric["criteria"]]
+    if anti.get("min_words"):
+        extra.append(f"  minimum length: {anti['min_words']} words")
+    extra.append(f"  pass mark: {float(rubric.get('pass_threshold', 0.6)):.0%}")
+
+    print(C.dim("\n  graded on:"))
+    for line in extra[1:]:
+        print(C.dim("  " + line))
+    answer_path = ANSWERS_DIR / f"{assessment['id']}.md"
+    prepare_answer_file(answer_path, assessment, extra, wrap=("<!--", " -->"))
+    print(f"\n  answer file: {C.cyan(str(answer_path))}  "
+          + C.dim("(the question is repeated inside it)"))
+    pause("read the question above, then Enter to open $EDITOR")
+    return edit_answer(answer_path, "answer"), answer_path
 
 
 def anti_reward_hacking(assessment: dict[str, Any], answer: str) -> tuple[bool, str]:
@@ -739,18 +864,30 @@ def judge_essay(
     return None
 
 
-def self_grade(
-    assessment: dict[str, Any]
-) -> tuple[float, list[dict[str, Any]]]:
-    """The R1 fail-open path: grade yourself against the shown reference, honestly."""
+def self_grade(assessment: dict[str, Any], answer: str) -> tuple[float, list[dict[str, Any]]]:
+    """The R1 fail-open path: grade yourself against the shown reference, honestly.
+
+    Both texts are put on screen first and the framing is stated outright, because the old
+    version dropped straight into `met? [y/n/h]` and read like a fresh quiz rather than a
+    marking task — you cannot answer honestly if you cannot tell what is being asked of you.
+    """
     g = assessment["grading"]
     rubric = g["rubric"]
-    print(C.dim("\n  --- reference answer (grade yourself against it, honestly) ---"))
+    print(f"\n{hr('═')}")
+    print(C.orange(C.bold("  SELF-GRADE — the judge could not run, so you are the marker")))
+    print(C.dim("  Below: what you wrote, then the reference. Then, for each criterion, say"))
+    print(C.dim("  whether YOUR answer did that thing.  y = did it, h = half, n = did not."))
+    print(C.dim("  You are not being asked the question again — you are marking your answer."))
+    print(hr("═"))
+    print(C.pink("\n  --- your answer ---"))
+    render_body(answer or "(empty)")
+    print(C.dim("\n  --- reference answer ---"))
     render_body(str(assessment.get("reference_answer", g.get("reference_answer", "(none)"))))
-    print(C.dim("\n  --- rubric ---"))
+    print(C.dim("\n  --- mark your own answer against each criterion ---"))
     values: dict[str, float] = {}
     for crit in rubric["criteria"]:
-        raw = ask(f"  [{crit['weight']:.0%}] {crit['text']}\n      met? [y/n/h]: ").strip().lower()
+        raw = ask(f"\n  [{crit['weight']:.0%}] Did your answer: {crit['text']}\n"
+                  f"      [y]es / [n]o / [h]alf: ").strip().lower()
         values[str(crit["id"])] = 1.0 if raw.startswith("y") else 0.5 if raw.startswith("h") else 0.0
     return score_from_criteria(list(rubric["criteria"]), values)
 
@@ -768,7 +905,8 @@ def grade_self_judge(assessment: dict[str, Any]) -> dict[str, Any]:
     threshold = float(rubric.get("pass_threshold", 0.6))
     words = len(answer.split())
 
-    judged = judge_essay(assessment, answer) if answer else None
+    print(C.dim("\n  grading (hosted judge)..."))
+    judged = judge_essay(assessment, answer)
     if judged is not None:
         score, per_criterion, summary = judged
         grader_id, confidence = f"omniroute:{JUDGE_MODEL}", "high"
@@ -783,9 +921,8 @@ def grade_self_judge(assessment: dict[str, Any]) -> dict[str, Any]:
         render_body(str(assessment.get("reference_answer",
                                        assessment["grading"].get("reference_answer", "(none)"))))
     else:
-        if answer:
-            print(C.orange("  judge unreachable — degrading to self-grade (confidence LOW)"))
-        score, per_criterion = self_grade(assessment)
+        print(C.orange("  judge unreachable — degrading to self-grade (confidence LOW)"))
+        score, per_criterion = self_grade(assessment, answer)
         grader_id, confidence = "self_grade_v0", "LOW"
 
     passed = (score >= threshold) and not capped
@@ -823,6 +960,13 @@ def run_assessment(lesson: Lesson, assessment: dict[str, Any], review: bool) -> 
     ms = int((time.monotonic() - t0) * 1000)
     print_envelope(env)
     log_attempt(lesson, assessment, env, ms)
+
+
+def run_assessment_or_skip(lesson: Lesson, assessment: dict[str, Any], review: bool) -> None:
+    try:
+        run_assessment(lesson, assessment, review)
+    except SkipItem:
+        print(C.dim(f"\n  skipped {assessment['id']} — nothing logged, it stays unattempted\n"))
 
 
 # ------------------------------------------------------------------------------ session runner
@@ -883,7 +1027,9 @@ def run_lesson(
         assessments = [a for a in assessments if a["id"] == only]
         if not assessments:
             raise SystemExit(f"no assessment '{only}' in {lesson_id}")
-    todo = [a for a in assessments if a["id"] not in passed_ids]
+    # `--only` means "run exactly this item" — asking for one item by name is already an explicit
+    # decision to redo it, so the already-passed filter must not swallow it.
+    todo = assessments if only else [a for a in assessments if a["id"] not in passed_ids]
     if not todo:
         print(C.green("\n  every assessment in this lesson already passed "
                       "— `make redo ID=...` to run it again.\n"))
@@ -893,7 +1039,7 @@ def run_lesson(
         # QUIT_KEY unwinds to here so a walked-away session ends with its progress summarised
         # rather than with a bare traceback. Items already graded stay graded.
         try:
-            run_assessment(lesson, a, review)
+            run_assessment_or_skip(lesson, a, review)
         except SessionQuit:
             remaining = len(todo) - i
             print(C.orange(f"\n  session ended — {remaining} item(s) left in this lesson."))
