@@ -12,8 +12,13 @@ Grading per strategy (vocabulary from PLAN.md §4 — do not rename):
                         runs (predict_race_verdict — probabilistic per R4, reported as such)
   hidden_tests          compose learner code + the lesson's test_code into a temp Go module
                         and run `go test -race` (plain local per R3: wall timeout + CPU rlimit)
-  llm_judge             Phase 0 has NO hosted judge; this degrades to self-grade against the
-                        shown reference at LOW confidence (the R1 fail-open shape)
+  llm_judge             reference-grounded hosted judge via the OmniRoute gateway; the model
+                        rules per rubric criterion and the WEIGHTED SCORE IS COMPUTED HERE, so
+                        it cannot invent a total. Unreachable gateway degrades to self-grade
+                        against the shown reference at LOW confidence (R1 fail-open).
+
+Press `?` at any prompt for an "explain like I'm 10" hint on whatever is on screen. Hints are
+reference-free (they never leak a graded answer) and counted into `hints_used` in the log.
 
 `verify` executes every lesson's gradeable material (references green, buggy code red, predict
 outputs derived not hand-typed, race constructions actually tripping) so a broken lesson is
@@ -33,6 +38,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -64,6 +71,21 @@ RACE_RUN_TIMEOUT_S = 10.0
 # How much runner output to show on a failure before truncating — enough for `go test` verdicts
 # plus a stack, without flooding the terminal.
 MAX_LOG_LINES = 60
+
+# --- hosted judge + hints (OmniRoute) -----------------------------------------------------
+# R1 STILL HOLDS. The OmniRoute gateway is local (localhost:20128); the models behind it are
+# NOT. Every call below is a network call to a hosted model — never describe this as offline.
+# What changed vs. the original Phase 0 note: the fail-open path is no longer the ONLY path.
+JUDGE_BASE_URL = os.environ.get("CRUCIBLE_LLM_BASE", "http://localhost:20128/v1")
+# Judge: quality over latency — it reads a rubric and a reference and must not be sloppy.
+JUDGE_MODEL = os.environ.get("CRUCIBLE_JUDGE_MODEL", "antigravity/claude-sonnet-4-6")
+# Hints: latency over quality — a hint you wait 8 s for is a hint you stop asking for.
+HINT_MODEL = os.environ.get("CRUCIBLE_HINT_MODEL", "auto/best-fast")
+# One sample, not R5's cap of 3. At n=1 attempts, paying 3x latency to measure a spread that
+# nothing yet acts on buys nothing; Phase 4's median+spread combiner is where 3 earns its cost.
+JUDGE_SAMPLES = 1
+# A judge round-trip measured ~3 s on this box; 90 s means "the gateway is wedged", not "slow".
+LLM_TIMEOUT_S = 90.0
 
 STRATEGIES = ("deterministic_choice", "deterministic_output", "hidden_tests", "llm_judge")
 # Bloom levels allowed on Track A objectives (docs/01-pedagogy.md bans Remember/Understand).
@@ -114,6 +136,72 @@ class C:
 
 def hr(char: str = "─", width: int = 72) -> str:
     return C.dim(char * width)
+
+
+# ------------------------------------------------------------------------------- llm client
+def _load_env_file() -> None:
+    """Read repo-root `.env` into os.environ. Five lines instead of a python-dotenv dependency.
+
+    Existing environment wins, so `CRUCIBLE_JUDGE_MODEL=... make lesson ...` overrides the file.
+    """
+    env_path = REPO_ROOT / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+
+
+def llm(prompt: str, *, model: str, max_tokens: int = 1200, system: str = "") -> str | None:
+    """One hosted-model call. Returns None on ANY failure — the caller degrades, never crashes.
+
+    Graceful degradation is the point (PLAN.md invariant 5): a wedged gateway, a missing key, or
+    an unparseable body must cost you a hint or a confidence level, never the study session.
+    """
+    key = os.environ.get("OMNIROUTE_API_KEY", "").strip()
+    if not key:
+        return None
+    messages: list[dict[str, str]] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    body = json.dumps({
+        "model": model,
+        "messages": messages,
+        # The gateway streams by default; we want one parseable body, not an SSE transcript.
+        "stream": False,
+        "temperature": 0,
+        "max_tokens": max_tokens,
+    }).encode()
+    req = urllib.request.Request(
+        f"{JUDGE_BASE_URL}/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT_S) as resp:
+            payload = json.loads(resp.read().decode())
+        content = payload["choices"][0]["message"]["content"]
+        return str(content).strip() or None
+    except (urllib.error.URLError, OSError, KeyError, IndexError, ValueError, TypeError):
+        return None
+
+
+def extract_json(text: str) -> dict[str, Any] | None:
+    """Pull one JSON object out of a model reply that may be fenced or prefaced with prose."""
+    fenced = re.search(r"```(?:json)?\s*(.+?)```", text, re.S)
+    candidate = fenced.group(1) if fenced else text
+    start, end = candidate.find("{"), candidate.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        parsed = json.loads(candidate[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 # --------------------------------------------------------------------------------- content IO
@@ -275,6 +363,7 @@ def log_attempt(lesson: Lesson, assessment: dict[str, Any], env: dict[str, Any],
         "max": env["max"],
         "confidence": env["confidence"],
         "grader_id": env["grader_id"],
+        "hints_used": HINTS.used,
         "latency_ms": ms,
     }
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -283,12 +372,81 @@ def log_attempt(lesson: Lesson, assessment: dict[str, Any], env: dict[str, Any],
 
 
 # ------------------------------------------------------------------------------- input helpers
+@dataclass
+class HintContext:
+    """What an ELI10 hint is *about*, plus how many were spent on the current item.
+
+    ponytail: one module-level instance instead of threading context through all eight `ask()`
+    call sites. This file is the throwaway probe (PLAN.md R2); when the loop moves into
+    `src/crucible/` the context gets passed explicitly and this global goes away.
+    """
+
+    lesson_title: str = ""
+    topic: str = ""      # the teach block or prompt the learner is staring at
+    used: int = 0        # hints spent on the CURRENT assessment; feeds `hints_used` in the log
+
+
+HINTS = HintContext()
+
+# The hint keystroke. `?` alone on a line — short enough to be reflex when you are stuck, and
+# it can never collide with a real answer (options are letters/numbers, predictions are output).
+HINT_KEY = "?"
+# Quit keystroke. `:q` not `q` — a bare letter is a plausible MCQ option or predicted output,
+# and a quit key that can be typed by accident as an answer is worse than no quit key.
+QUIT_KEY = ":q"
+
+
+def eli10() -> None:
+    """Explain the thing on screen as if to a smart 10-year-old, then hand control back.
+
+    Reference-free ON PURPOSE: a hint must never leak the graded answer. The prompt forbids it
+    and the topic text is the teach material, not the rubric or the reference.
+    """
+    if not HINTS.topic.strip():
+        print(C.dim("  (nothing to explain here)"))
+        return
+    print(C.dim("  thinking..."))
+    reply = llm(
+        f"Lesson: {HINTS.lesson_title}\n\nMaterial the learner is stuck on:\n---\n"
+        f"{HINTS.topic}\n---\n\nExplain the IDEA above like I am 10 years old.",
+        model=HINT_MODEL,
+        max_tokens=600,
+        system=(
+            "You explain Go concurrency to a sharp 10-year-old: everyday analogies, short "
+            "sentences, no jargon without unpacking it, at most 150 words. The reader is a "
+            "strong programmer who is new to Go, so never condescend about programming itself "
+            "— only make the CONCEPT concrete. CRITICAL: if the material contains a question, "
+            "quiz, or exercise, explain the underlying idea but NEVER reveal or hint at which "
+            "answer is correct."
+        ),
+    )
+    if reply is None:
+        print(C.orange("  hint unavailable (judge/gateway unreachable) — continuing without it"))
+        return
+    HINTS.used += 1
+    print()
+    render_body(reply, indent="  " + C.dim("│ "))
+    print()
+
+
+class SessionQuit(Exception):
+    """Raised to end a study session cleanly. Graded items are already durable in the log."""
+
+
 def ask(prompt: str) -> str:
-    try:
-        return input(C.pink(prompt))
-    except (EOFError, KeyboardInterrupt):
-        print()
-        raise SystemExit(C.dim("session aborted — nothing logged for the open item")) from None
+    """Read one line, intercepting the hint and quit keys so neither lands in a graded answer."""
+    while True:
+        try:
+            raw = input(C.pink(prompt))
+        except (EOFError, KeyboardInterrupt):
+            print()
+            raise SessionQuit from None
+        if raw.strip() == HINT_KEY:
+            eli10()
+            continue
+        if raw.strip() == QUIT_KEY:
+            raise SessionQuit
+        return raw
 
 
 def ask_multiline(prompt: str) -> str:
@@ -311,7 +469,7 @@ def open_editor(path: Path) -> None:
 
 
 def pause(msg: str = "Enter to continue") -> None:
-    ask(C.dim(f"  ⏎ {msg} "))
+    ask(C.dim(f"  ⏎ {msg}  ({HINT_KEY} = explain like I'm 10, {QUIT_KEY} = end session) "))
 
 
 # ---------------------------------------------------------------------------------- rendering
@@ -463,14 +621,29 @@ def grade_hidden_tests(assessment: dict[str, Any], review: bool) -> dict[str, An
                     evidence=f"attempts={attempts}", logs=tail(last.combined if last else ""))
 
 
-def grade_self_judge(assessment: dict[str, Any]) -> dict[str, Any]:
-    """Phase 0 stand-in for the hosted judge: the R1 fail-open path as the ONLY path.
+def score_from_criteria(
+    criteria: list[dict[str, Any]], values: dict[str, float]
+) -> tuple[float, list[dict[str, Any]]]:
+    """Fold per-criterion met/half/unmet into a weighted score.
 
-    Self-grade against the shown reference, confidence LOW. The hosted judge arrives in
-    Phase 4; nothing here calls a network.
+    The MODEL never returns a score — it only judges each criterion. The arithmetic happens
+    here, in Python, so a judge cannot invent a number that its own per-criterion verdicts do
+    not support. Same structural move as the résumé guard: make the bad outcome impossible by
+    construction rather than by asking the model nicely.
     """
-    g = assessment["grading"]
-    rubric = g["rubric"]
+    score = 0.0
+    rows: list[dict[str, Any]] = []
+    for crit in criteria:
+        weight = float(crit["weight"])
+        value = float(values.get(str(crit["id"]), 0.0))
+        value = min(1.0, max(0.0, value))
+        score += weight * value
+        rows.append({"id": crit["id"], "weight": weight, "value": value})
+    return score, rows
+
+
+def collect_essay(assessment: dict[str, Any]) -> tuple[str, Path]:
+    """Open the answer file in $EDITOR and read it back. Persists so you can iterate across days."""
     aid = assessment["id"]
     ANSWERS_DIR.mkdir(parents=True, exist_ok=True)
     answer_path = ANSWERS_DIR / f"{aid}.md"
@@ -478,36 +651,148 @@ def grade_self_judge(assessment: dict[str, Any]) -> dict[str, Any]:
         answer_path.write_text("")
     print(f"\n  write your answer in: {C.cyan(str(answer_path))}")
     open_editor(answer_path)
-    answer = answer_path.read_text().strip()
-    words = len(answer.split())
+    return answer_path.read_text().strip(), answer_path
+
+
+def anti_reward_hacking(assessment: dict[str, Any], answer: str) -> tuple[bool, str]:
+    """Deterministic guards that run OUTSIDE the model and can only ever LOWER the outcome.
+
+    Deterministic-wins, applied to the judge's own input: a word-count floor and banned phrases
+    are decidable by a machine, so no model opinion is consulted about them.
+    """
+    g = assessment["grading"]
+    rubric = g["rubric"]
     # canonical schema nests anti_reward_hacking inside rubric; tolerate grading-level too
     anti = rubric.get("anti_reward_hacking", g.get("anti_reward_hacking", {}))
-    min_words = int(anti.get("min_words", 0))
     capped = False
+    notes: list[str] = []
+    min_words = int(anti.get("min_words", 0))
+    words = len(answer.split())
     if min_words and words < min_words:
         print(C.orange(f"  under min_words ({words} < {min_words}) — item cannot PASS"))
+        notes.append(f"under min_words {words}<{min_words}")
         capped = True
     for phrase in anti.get("penalize_if_contains", []):
         if phrase.lower() in answer.lower():
             print(C.orange(f"  contains penalized phrase '{phrase}' — item cannot PASS"))
+            notes.append(f"penalized phrase '{phrase}'")
             capped = True
+    return capped, "; ".join(notes)
+
+
+def judge_essay(
+    assessment: dict[str, Any], answer: str
+) -> tuple[float, list[dict[str, Any]], str] | None:
+    """Ask the hosted judge to rule on each rubric criterion. None => caller must degrade.
+
+    Reference-grounded (R7): the judge never runs without the locked reference answer in its
+    prompt, so it grades against a fixed standard rather than its own taste.
+    """
+    g = assessment["grading"]
+    rubric = g["rubric"]
+    criteria: list[dict[str, Any]] = list(rubric["criteria"])
+    reference = str(assessment.get("reference_answer", g.get("reference_answer", ""))).strip()
+    if not reference:
+        return None
+    criteria_block = "\n".join(
+        f'- id "{c["id"]}" (weight {c["weight"]}): {c["text"]}' for c in criteria
+    )
+    prompt = (
+        f"QUESTION\n{assessment.get('prompt', '')}\n\n"
+        f"REFERENCE ANSWER (the locked standard — grade against THIS, not your own taste)\n"
+        f"{reference}\n\n"
+        f"RUBRIC CRITERIA\n{criteria_block}\n\n"
+        f"LEARNER ANSWER\n{answer}\n\n"
+        'Return ONLY JSON: {"criteria":[{"id":"<id>","value":1|0.5|0,"why":"<one sentence>"}],'
+        '"summary":"<one sentence>"}'
+    )
+    system = (
+        "You grade one short design-defense answer for a single advanced engineer studying Go. "
+        "Per criterion: 1 = fully met, 0.5 = partially met, 0 = not met. The house bar is "
+        "strict — an answer that names no rejected alternative, no concrete failure mode, and "
+        "no number does NOT meet a criterion asking for one. Reward correct reasoning that "
+        "differs in wording from the reference; punish fluent restatement with no mechanism. "
+        "Do not output a total score — only per-criterion values. Output JSON and nothing else."
+    )
+    for _ in range(JUDGE_SAMPLES):
+        reply = llm(prompt, model=JUDGE_MODEL, max_tokens=1500, system=system)
+        if reply is None:
+            continue
+        parsed = extract_json(reply)
+        if not parsed or not isinstance(parsed.get("criteria"), list):
+            continue
+        values: dict[str, float] = {}
+        whys: dict[str, str] = {}
+        for row in parsed["criteria"]:
+            if isinstance(row, dict) and "id" in row:
+                try:
+                    values[str(row["id"])] = float(row.get("value", 0))
+                except (TypeError, ValueError):
+                    values[str(row["id"])] = 0.0
+                whys[str(row["id"])] = str(row.get("why", ""))
+        if not values:
+            continue
+        score, rows = score_from_criteria(criteria, values)
+        for row in rows:
+            row["why"] = whys.get(str(row["id"]), "")
+        return score, rows, str(parsed.get("summary", ""))
+    return None
+
+
+def self_grade(
+    assessment: dict[str, Any]
+) -> tuple[float, list[dict[str, Any]]]:
+    """The R1 fail-open path: grade yourself against the shown reference, honestly."""
+    g = assessment["grading"]
+    rubric = g["rubric"]
     print(C.dim("\n  --- reference answer (grade yourself against it, honestly) ---"))
-    render_body(assessment.get("reference_answer", g.get("reference_answer", "(none)")))
+    render_body(str(assessment.get("reference_answer", g.get("reference_answer", "(none)"))))
     print(C.dim("\n  --- rubric ---"))
-    per_criterion: list[dict[str, Any]] = []
-    score = 0.0
+    values: dict[str, float] = {}
     for crit in rubric["criteria"]:
         raw = ask(f"  [{crit['weight']:.0%}] {crit['text']}\n      met? [y/n/h]: ").strip().lower()
-        val = 1.0 if raw.startswith("y") else 0.5 if raw.startswith("h") else 0.0
-        score += crit["weight"] * val
-        per_criterion.append({"id": crit["id"], "weight": crit["weight"], "value": val})
+        values[str(crit["id"])] = 1.0 if raw.startswith("y") else 0.5 if raw.startswith("h") else 0.0
+    return score_from_criteria(list(rubric["criteria"]), values)
+
+
+def grade_self_judge(assessment: dict[str, Any]) -> dict[str, Any]:
+    """llm_judge strategy: hosted judge first, self-grade when the gateway is unreachable.
+
+    Name kept (PLAN.md §4 forbids silent renames); what changed is that the hosted judge is now
+    the primary path and self-grading is the documented degradation, which is the shape R1
+    always specified.
+    """
+    answer, _path = collect_essay(assessment)
+    capped, capped_note = anti_reward_hacking(assessment, answer)
+    rubric = assessment["grading"]["rubric"]
     threshold = float(rubric.get("pass_threshold", 0.6))
+    words = len(answer.split())
+
+    judged = judge_essay(assessment, answer) if answer else None
+    if judged is not None:
+        score, per_criterion, summary = judged
+        grader_id, confidence = f"omniroute:{JUDGE_MODEL}", "high"
+        print(C.dim("\n  --- judge ---"))
+        for row in per_criterion:
+            mark = C.green("met") if row["value"] == 1.0 else (
+                C.orange("half") if row["value"] == 0.5 else C.red("miss"))
+            print(f"  [{row['weight']:.0%}] {mark}  {row.get('why', '')}")
+        if summary:
+            print(C.dim(f"\n  {summary}"))
+        print(C.dim("\n  --- reference answer (read it either way) ---"))
+        render_body(str(assessment.get("reference_answer",
+                                       assessment["grading"].get("reference_answer", "(none)"))))
+    else:
+        if answer:
+            print(C.orange("  judge unreachable — degrading to self-grade (confidence LOW)"))
+        score, per_criterion = self_grade(assessment)
+        grader_id, confidence = "self_grade_v0", "LOW"
+
     passed = (score >= threshold) and not capped
-    verdict = "PASS" if passed else "FAIL"
-    return envelope(score, 1.0, verdict, grader_id="self_grade_v0", confidence="LOW",
-                    per_criterion=per_criterion,
+    return envelope(score, 1.0, "PASS" if passed else "FAIL", grader_id=grader_id,
+                    confidence=confidence, per_criterion=per_criterion,
                     evidence=f"threshold={threshold}; words={words}"
-                             + ("; capped by anti_reward_hacking" if capped else ""))
+                             + (f"; capped: {capped_note}" if capped else ""))
 
 
 def run_assessment(lesson: Lesson, assessment: dict[str, Any], review: bool) -> None:
@@ -519,6 +804,8 @@ def run_assessment(lesson: Lesson, assessment: dict[str, Any], review: bool) -> 
     print(hr("═"))
     print()
     render_body(assessment.get("prompt", ""))
+    HINTS.topic = str(assessment.get("prompt", ""))
+    HINTS.used = 0
     t0 = time.monotonic()
     if strategy == "deterministic_choice":
         env = grade_choice(assessment)
@@ -539,40 +826,84 @@ def run_assessment(lesson: Lesson, assessment: dict[str, Any], review: bool) -> 
 
 
 # ------------------------------------------------------------------------------ session runner
-def run_lesson(lessons: dict[str, Lesson], lesson_id: str, review: bool, only: str | None) -> None:
+def run_lesson(
+    lessons: dict[str, Lesson],
+    lesson_id: str,
+    review: bool,
+    only: str | None,
+    *,
+    redo: bool = False,
+    teach: bool = False,
+) -> None:
+    """Run a lesson, resuming past whatever already passed.
+
+    A session you walked away from is the normal case, not the error case: every graded item is
+    already durable in the append-only log the instant it is graded, so resuming is a matter of
+    *reading* that log rather than storing extra state. Passed items are skipped and the teach
+    section is skipped on re-entry (`--teach` re-reads it, `--redo` runs the whole thing again).
+    """
     lesson = lesson_or_die(lessons, lesson_id)
+    assessments = list(lesson.get("assessments", []))
+    done = latest_verdicts().get(lesson_id, {}) if not redo else {}
+    passed_ids = {aid for aid, verdict in done.items() if verdict == "PASS"}
+    resuming = bool(done) and not only
+
     print(f"\n{hr('━')}")
     print(C.purple(C.bold(f"  {lesson['title']}")))
     print(C.dim(f"  {lesson.get('week', '')} · {lesson['id']} · rev {lesson.get('content_rev')}"
                 f" · {'review (test-first)' if review else 'teach → test'}"))
     print(hr("━"))
-    if not review and not only:
+    HINTS.lesson_title = str(lesson.get("title", lesson["id"]))
+
+    # Teach on a first visit; on a resume you have already read it — say so instead of replaying.
+    show_teach = not review and not only and (teach or not resuming)
+    if resuming:
+        n_pass = len(passed_ids & {a["id"] for a in assessments})
+        print(C.orange(f"\n  resuming — {n_pass}/{len(assessments)} already passed, skipping those"
+                       + ("" if show_teach else "; teach skipped (--teach to re-read)")))
+    if show_teach:
         print()
         render_body(str(lesson.get("summary", "")))
+        HINTS.topic = str(lesson.get("summary", ""))
         for block in lesson.get("teach", []):
             print(f"\n{C.pink(C.bold('  § ' + block['heading']))}\n")
             render_body(block["body"])
+            HINTS.topic = f"{block['heading']}\n\n{block['body']}"
             pause()
         for ex in lesson.get("worked_examples", []):
             print(f"\n{C.orange(C.bold('  worked example'))} {C.dim(ex['id'])}\n")
             render_body(ex["prompt"])
+            HINTS.topic = str(ex["prompt"])
             pause("think first, then Enter to reveal the solution")
             render_body(ex["solution"])
+            HINTS.topic = f"{ex['prompt']}\n\n{ex['solution']}"
             pause()
-    assessments = lesson.get("assessments", [])
+
     if only:
         assessments = [a for a in assessments if a["id"] == only]
         if not assessments:
             raise SystemExit(f"no assessment '{only}' in {lesson_id}")
-    passes = 0
-    for a in assessments:
-        run_assessment(lesson, a, review)
-    # Re-read the log for this session's verdicts rather than tracking state twice.
+    todo = [a for a in assessments if a["id"] not in passed_ids]
+    if not todo:
+        print(C.green("\n  every assessment in this lesson already passed "
+                      "— `make redo ID=...` to run it again.\n"))
+        return
+
+    for i, a in enumerate(todo):
+        # QUIT_KEY unwinds to here so a walked-away session ends with its progress summarised
+        # rather than with a bare traceback. Items already graded stay graded.
+        try:
+            run_assessment(lesson, a, review)
+        except SessionQuit:
+            remaining = len(todo) - i
+            print(C.orange(f"\n  session ended — {remaining} item(s) left in this lesson."))
+            print(C.dim(f"  resume with: make lesson ID={lesson_id}\n"))
+            return
+
     print(f"\n{C.purple(C.bold('  session done.'))}")
     if lesson.get("limitations"):
         print(C.orange("\n  Limitations (what a green run does NOT prove):"))
         render_body(str(lesson["limitations"]).strip(), indent="    ")
-    _ = passes
 
 
 # ------------------------------------------------------------------------------------- verify
@@ -891,17 +1222,23 @@ def main() -> int:
     p_run.add_argument("lesson_id")
     p_run.add_argument("--review", action="store_true", help="test-first, reveal-on-miss")
     p_run.add_argument("--only", help="run a single assessment id")
+    p_run.add_argument("--redo", action="store_true",
+                       help="re-run the whole lesson, including items already passed")
+    p_run.add_argument("--teach", action="store_true",
+                       help="re-read the teach section even when resuming")
     p_ver = sub.add_parser("verify", help="prove every lesson is gradeable by construction")
     p_ver.add_argument("lesson_id", nargs="?")
     p_ver.add_argument("--quick", action="store_true", help="structural checks only, skip go runs")
     sub.add_parser("status", help="streak + honest numbers")
     args = parser.parse_args()
 
+    _load_env_file()
     lessons = load_lessons()
     if args.cmd == "list":
         cmd_list(lessons)
     elif args.cmd == "run":
-        run_lesson(lessons, args.lesson_id, args.review, args.only)
+        run_lesson(lessons, args.lesson_id, args.review, args.only,
+                   redo=args.redo, teach=args.teach)
     elif args.cmd == "verify":
         return cmd_verify(lessons, args.lesson_id, args.quick)
     elif args.cmd == "status":
@@ -910,4 +1247,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SessionQuit:
+        print(C.dim("\n  session ended — nothing logged for the open item\n"))
+        raise SystemExit(0) from None

@@ -1,10 +1,16 @@
 # CLAUDE.md — Crucible (build guide for a fresh session)
 
-> **STATUS: Phase 0 content pilot BUILT (2026-07-20); daily-use trial IN PROGRESS.** 14 lessons
-> (`content/go/go04a…go05g`, conventions in `content/go/PILOT-CONVENTIONS.md`) run on the throwaway
-> CLI harness `pilot/pilot.py` (`make list` / `make lesson ID=<id>` / `make verify` / `make status`;
-> conda env `crucible`, wired into the Makefile). **Do NOT build Phase 1+ (engine, gate, mastery,
-> judge) until the 2-week daily-use bar in §4 is met** — `make status` tracks it. Backlog + authoring
+> **STATUS: Phase 0 content pilot BUILT (2026-07-20); daily-use trial RESTARTED 2026-09-01.** The
+> first trial logged 1 study day and stalled for 40 days on an external cause (Claude Code access
+> lost), so the 14-day bar has never actually been tested — it is being run now, not re-litigated.
+> 14 lessons (`content/go/go04a…go05g`, conventions in `content/go/PILOT-CONVENTIONS.md`) run on the
+> throwaway CLI harness `pilot/pilot.py` (`make list` / `make lesson ID=<id>` / `make verify` /
+> `make status`; conda env `crucible`, wired into the Makefile). Two 2026-09-01 additions, both
+> inside the throwaway harness and neither an engine: `llm_judge` items are graded by a
+> reference-grounded **hosted judge** through the local OmniRoute gateway (key in gitignored
+> `.env`), and `?` at any prompt gives an "explain like I'm 10" hint counted into `hints_used`.
+> **Do NOT build Phase 1+ (engine, gate, mastery, scheduler) until the 2-week daily-use bar in §4
+> is met** — `make status` tracks it. Backlog + authoring
 > cost: `docs/curriculum/go-backlog.md`. Web-dashboard theme tokens (for Phase 6, chosen by Bibek):
 > `docs/theme/dracula-terminal.css`.
 >
@@ -62,7 +68,9 @@ engine**:
   `conclave`), each following the `go04` YAML schema. Grade code answers with **plain `go test`** — a
   tiny throwaway harness (drop learner code + the lesson's tests into a temp Go module, run `go test
   -race`, show pass/fail + the minimal failing input). **No** sandbox, **no** schema-gate, **no**
-  mastery model, **no** LLM-judge yet.
+  mastery model. *(Amended 2026-09-01: the judge arrived early, because the one measured session
+  showed self-grading an essay was where the loop broke. It is still the throwaway harness — one
+  sample, no gold-set calibration, fail-open to self-grade. The Phase 1 engine remains unbuilt.)*
 - **Use it daily for 2+ weeks.** If it teaches and he keeps opening it, *then* build Phase 1 (the
   executable green-gate) and the rest of the roadmap. If it doesn't get used, fix the content/loop
   before building anything.
@@ -141,7 +149,8 @@ crucible/
 │   └── theme/dracula-terminal.css   (web-dashboard tokens, Phase 6 — chosen by Bibek)
 ├── content/examples/go04-concurrency-discrimination.yaml   (canonical lesson schema)
 ├── content/go/  PILOT-CONVENTIONS.md + 14 pilot lessons (go04a…go05g), all verify-green
-├── pilot/       THROWAWAY Phase 0 harness: pilot.py (CLI+graders+verify), attempts.jsonl,
+├── pilot/       THROWAWAY Phase 0 harness: pilot.py (CLI+graders+verify), test_pilot.py,
+│                attempts.jsonl,
 │                answers/ (learner work), scratch/ (gitignored temp Go modules)
 └── RESEARCH/    12 raw research docs (+ _synthesis.md, _critique.md)
     # src/ + pyproject.toml still do not exist — that is Phase 1, gated on §4's daily-use bar.
